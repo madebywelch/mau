@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from importlib import resources
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -85,6 +86,13 @@ class Orchestrator:
         self.world.request = user_request
         self._emit("session_start", {"request": user_request})
 
+        if (
+            self.world.workspace is not None
+            and self.world.workspace.brownfield
+            and "codebase.md" not in self.world.shared_docs
+        ):
+            self._discover_codebase()
+
         product = self._spawn_agent(Role.PRODUCT, "product-1", "")
         kickoff = Message(
             from_agent="user",
@@ -96,6 +104,69 @@ class Orchestrator:
         self.bus.deliver(kickoff)
         self._persist()
         return self._main_loop()
+
+    def _discover_codebase(self) -> None:
+        """Brownfield-only pre-flight: scan the existing project and write
+        codebase.md into shared_docs so all subsequent agents see it."""
+        ws = self.world.workspace
+        if ws is None:
+            return
+        try:
+            system = (
+                resources.files("mau_cli.prompts")
+                .joinpath("_codebase_analyst.md")
+                .read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            self._emit("discovery_skipped", {"reason": "analyst prompt not found"})
+            return
+
+        shared_path = Path(ws.shared_dir) / "codebase.md"
+        user_prompt = (
+            f"Project root: {ws.code_dir}\n"
+            f"Write your scan to this absolute path: {shared_path}\n"
+            "Follow your role instructions exactly. End with the DELIVERABLE line."
+        )
+
+        import time as _t
+        self.world.discovery_status = "in_progress"
+        self.world.discovery_started_at = _t.monotonic()
+        self._persist()
+        self._emit("discovery_start", {"project_root": ws.code_dir})
+        try:
+            result = self.backend.call_agentic(
+                system_prompt=system,
+                user_prompt=user_prompt,
+                workspace_dir=ws.code_dir,
+                extra_dirs=[ws.shared_dir],
+                max_budget_usd=self.max_budget_usd,
+            )
+        except Exception as e:
+            self.world.discovery_status = "failed"
+            self.world.discovery_started_at = None
+            self._emit("discovery_error", {"error": str(e)})
+            return
+
+        self.world.usage.add(result.usage)
+        if shared_path.exists():
+            try:
+                self.world.shared_docs["codebase.md"] = shared_path.read_text(
+                    encoding="utf-8"
+                )
+                self.world.discovery_status = "complete"
+                self.world.discovery_started_at = None
+                self._emit(
+                    "discovery_complete",
+                    {"size": len(self.world.shared_docs["codebase.md"])},
+                )
+            except OSError as e:
+                self.world.discovery_status = "failed"
+                self.world.discovery_started_at = None
+                self._emit("discovery_read_error", {"error": str(e)})
+        else:
+            self.world.discovery_status = "failed"
+            self.world.discovery_started_at = None
+            self._emit("discovery_no_output", {"path": str(shared_path)})
 
     def resume(self, fallback_request: Optional[str] = None) -> WorldState:
         """Continue an existing session. World state has already been

@@ -31,3 +31,16 @@ own the technical decomposition.
 - Re-litigating the PRD with product over and over. Commit and move.
 - Spawning multiple Tech Leads for one epic.
 - Decomposing into engineer-level tasks yourself instead of delegating.
+
+## When operating on an existing codebase
+
+If `codebase.md` is in `SHARED_DOCS`, scope work streams to the **delta
+the feature requires**, not to "every stream a real project needs":
+
+- Don't auto-spawn database / devops / qa unless the change actually
+  needs schema migrations / infra changes / new tests. A pure UI tweak
+  on an existing Next.js app is one frontend stream.
+- The existing project has its own DB, CI, deploy pipeline. Don't have
+  the team rebuild infra; have them extend it.
+- Pass `codebase.md`-derived context to the Tech Lead in your directive
+  so they don't re-derive it.

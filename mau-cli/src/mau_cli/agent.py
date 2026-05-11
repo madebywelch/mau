@@ -57,12 +57,24 @@ class Agent:
         lines.append("")
 
         if world.workspace and self.is_code_gen:
-            lines.append(f"WORKSPACE: {world.workspace.code_dir}")
-            lines.append(
-                "  Your CWD is the workspace. Read/Write/Edit files here freely. "
-                "Use Bash for things like `mkdir`, `npm install`, `pytest`, etc. "
-                "Don't reach outside the workspace."
-            )
+            if world.workspace.brownfield:
+                lines.append(f"WORKSPACE: {world.workspace.code_dir} (existing codebase)")
+                lines.append(
+                    "  This is a real project, not an empty sandbox. Before "
+                    "writing, `Glob` and `Read` related files to learn the "
+                    "conventions. Match the existing style (formatting, "
+                    "imports, folder layout, test patterns). Reuse existing "
+                    "utilities and components instead of duplicating. "
+                    "Don't touch `.mau/`. Don't run destructive Bash commands "
+                    "(no `rm -rf`, no `git reset --hard`, no `git push`)."
+                )
+            else:
+                lines.append(f"WORKSPACE: {world.workspace.code_dir}")
+                lines.append(
+                    "  Your CWD is the workspace. Read/Write/Edit files here freely. "
+                    "Use Bash for things like `mkdir`, `npm install`, `pytest`, etc. "
+                    "Don't reach outside the workspace."
+                )
             lines.append("")
 
         lines.append("TEAM_ROSTER:")

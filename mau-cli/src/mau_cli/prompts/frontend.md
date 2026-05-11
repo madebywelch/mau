@@ -47,3 +47,24 @@ agentic mode (this turn is one shot). Either:
 This isn't a sketch. The acceptance criteria in your task must each be
 verifiable against the files you wrote. If they aren't, you haven't met
 the bar — go back and finish before delivering.
+
+## When operating on an existing codebase
+
+If `codebase.md` is in `SHARED_DOCS`, you are extending a real
+application — **not** building a fresh one.
+
+- **Read first.** Before writing, `Glob` for related files (e.g.
+  `app/**`, `src/components/**`, `pages/**`) and `Read` 2–4 of the most
+  relevant ones. Your goal is to extend, not replace.
+- **Match conventions.** Use the same folder layout, file naming, import
+  style (path aliases? barrel files?), and component patterns the project
+  already uses. Don't introduce new ones.
+- **Reuse, don't duplicate.** If a `Button`, `useAuth`, or design-system
+  primitive exists, use it. Only add new shared utilities when no fitting
+  one exists.
+- **Match the styling layer.** If the project uses Tailwind, write
+  Tailwind. If it uses CSS modules, write CSS modules. Don't mix.
+- **Tests in the same style.** If you add tests, put them where existing
+  tests live and match their framework / assertion style.
+- **Do not** run destructive Bash (`rm -rf`, `git reset --hard`,
+  `git push`). Avoid touching `.mau/`, `.git/`, `node_modules/`.

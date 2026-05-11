@@ -29,3 +29,22 @@ End with:
   complete).
 - No secrets committed; env values are placeholders.
 - CI runs on a fresh checkout without manual fix-up.
+
+## When operating on an existing codebase
+
+If `codebase.md` is in `SHARED_DOCS`, the project already has CI / infra.
+Extend it; don't replace it.
+
+- **Read first.** `Glob` for `Dockerfile*`, `docker-compose*`,
+  `.github/workflows/*`, `.gitlab-ci.yml`, `vercel.json`,
+  `netlify.toml`, `fly.toml`, `Procfile`, etc. `Read` whatever exists.
+- **Match the deploy target.** If the project deploys to Vercel, don't
+  add a Dockerfile and Kubernetes manifests "just in case." If the team
+  uses GitHub Actions, don't introduce CircleCI.
+- **Add jobs / steps to existing workflows** when possible, instead of
+  creating parallel pipelines.
+- **`.env.example`**: extend the existing one, don't create a second.
+- **Healthchecks / observability**: match the existing log format,
+  metric naming, and tracing approach.
+- **Do not** push to remote, create deploy hooks, or run `vercel deploy`
+  / `flyctl deploy` etc. You write config; the team triggers deploys.

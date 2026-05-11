@@ -70,6 +70,18 @@ SPLASH = r"""
     help="Workspace root. Defaults to ./.mau/runs/<timestamp>/. Code goes in <root>/workspace/.",
 )
 @click.option(
+    "--in",
+    "in_path",
+    type=click.Path(file_okay=False, exists=True, resolve_path=True),
+    is_flag=False,
+    flag_value=".",
+    default=None,
+    help="Brownfield mode: agents work directly in this existing project "
+    "directory and write files to its root. Metadata goes to "
+    "<path>/.mau/runs/<ts>/. Pass `--in` with no value to use the current "
+    "directory. Mutually exclusive with --workspace.",
+)
+@click.option(
     "--resume",
     "resume_path",
     default=None,
@@ -103,6 +115,7 @@ def main(
     max_agents: int,
     concurrency: int,
     workspace_path: Optional[str],
+    in_path: Optional[str],
     resume_path: Optional[str],
     max_budget_usd: Optional[float],
     no_tui: bool,
@@ -110,6 +123,14 @@ def main(
 ) -> None:
     console = Console()
     console.print(Text(SPLASH.format(version=__version__), style="bold cyan"))
+
+    if in_path and workspace_path:
+        console.print(
+            "[red]--in and --workspace are mutually exclusive. "
+            "Pick one: --in points at an existing project; --workspace "
+            "creates a fresh greenfield root.[/red]"
+        )
+        sys.exit(2)
 
     resume_snapshot: Optional[dict] = None
     resume_workspace_root: Optional[str] = None
@@ -131,17 +152,35 @@ def main(
 
     backend_obj = select_backend(backend.lower())
     if resume_workspace_root:
-        workspace = Workspace(root=resume_workspace_root)
+        workspace = Workspace(
+            root=resume_workspace_root,
+            code_dir_override=(resume_snapshot or {}).get("workspace_code_dir_override"),
+            brownfield=bool((resume_snapshot or {}).get("workspace_brownfield", False)),
+        )
+    elif in_path is not None:
+        target = Path(in_path).resolve()
+        root = target / ".mau" / "runs" / time.strftime("%Y%m%d-%H%M%S")
+        workspace = Workspace(
+            root=str(root),
+            code_dir_override=str(target),
+            brownfield=True,
+        )
     else:
         workspace = Workspace(root=str(Path(workspace_path or _default_workspace_root()).resolve()))
     workspace.ensure()
 
     budget_str = f"${max_budget_usd:.2f}" if max_budget_usd is not None else "unlimited"
+    mode_str = "brownfield (existing codebase)" if workspace.brownfield else "greenfield"
+    code_dir_line = (
+        f"[bold]Code dir:[/bold]  {workspace.code_dir}\n" if workspace.brownfield else ""
+    )
     console.print(
         Panel(
             Text.from_markup(
                 f"[bold]Backend:[/bold]   {backend_obj.name}\n"
+                f"[bold]Mode:[/bold]      {mode_str}\n"
                 f"[bold]Workspace:[/bold] {workspace.root}\n"
+                f"{code_dir_line}"
                 f"[bold]Limits:[/bold]    turns={max_turns}  agents={max_agents}  "
                 f"concurrency={concurrency}  budget={budget_str}"
             ),
