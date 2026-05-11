@@ -26,3 +26,22 @@ End with:
 - Tests must run (not just be syntactically valid).
 - Each acceptance criterion is mapped to at least one test.
 - Failure messages are informative.
+
+## When operating on an existing codebase
+
+If `codebase.md` is in `SHARED_DOCS`, the project already has a test
+setup; extend it rather than starting your own.
+
+- **Read first.** `Glob` for existing tests (`**/*.test.*`, `**/*_test.*`,
+  `tests/**`, `__tests__/**`, `spec/**`) and `Read` 2–4 of them. Match
+  framework, assertion style, fixture/helper usage.
+- **Don't introduce a second test framework.** If the project uses
+  Vitest, write Vitest; if Jest, Jest; if pytest, pytest.
+- **Reuse existing helpers** (`render`, `setupTestDB`, fixture factories)
+  rather than creating parallel ones.
+- **Place tests where existing tests live** (co-located vs. `tests/`),
+  matching the existing convention.
+- **Run the test command** (the one in `package.json scripts.test` /
+  `Makefile` / `justfile`) via `Bash` to verify your tests pass before
+  delivering — but only the tests you wrote, scoped to the feature; do
+  not run the full suite if it's slow or hits external services.

@@ -198,19 +198,28 @@ class AgentTurn:
 class Workspace:
     """The on-disk root for a session.
 
-    Layout:
+    Greenfield layout (default):
       <root>/
         workspace/  ← agents write code here
         shared/     ← cross-agent artifacts (PRD, api-contract, schema, ...)
         logs/       ← per-agent JSONL transcripts
         session.json ← serialized WorldState
+
+    Brownfield layout (--in <project>):
+      <project>/        ← agents write code directly into the existing repo
+      <project>/.mau/runs/<ts>/
+        shared/
+        logs/
+        session.json
     """
 
     root: str  # absolute path
+    code_dir_override: Optional[str] = None  # brownfield: path to existing repo
+    brownfield: bool = False
 
     @property
     def code_dir(self) -> str:
-        return str(Path(self.root) / "workspace")
+        return self.code_dir_override or str(Path(self.root) / "workspace")
 
     @property
     def shared_dir(self) -> str:
@@ -225,9 +234,34 @@ class Workspace:
         return str(Path(self.root) / "session.json")
 
     def ensure(self) -> None:
-        Path(self.code_dir).mkdir(parents=True, exist_ok=True)
         Path(self.shared_dir).mkdir(parents=True, exist_ok=True)
         Path(self.logs_dir).mkdir(parents=True, exist_ok=True)
+        if self.brownfield:
+            self._ensure_gitignore_entry()
+        else:
+            Path(self.code_dir).mkdir(parents=True, exist_ok=True)
+
+    def _ensure_gitignore_entry(self) -> None:
+        """Append `.mau/` to the project's .gitignore if it has one and
+        the entry isn't there yet. Don't create the file — some users
+        don't track this dir under git, and creating it would surprise them."""
+        gi = Path(self.code_dir) / ".gitignore"
+        if not gi.exists():
+            return
+        try:
+            existing = gi.read_text(encoding="utf-8")
+        except OSError:
+            return
+        # Match `.mau` or `.mau/` on its own line, ignoring trailing whitespace.
+        for raw_line in existing.splitlines():
+            line = raw_line.strip()
+            if line in (".mau", ".mau/"):
+                return
+        suffix = "" if existing.endswith("\n") or not existing else "\n"
+        try:
+            gi.write_text(existing + suffix + ".mau/\n", encoding="utf-8")
+        except OSError:
+            pass
 
 
 @dataclass
@@ -246,11 +280,24 @@ class WorldState:
     finished: bool = False
     final_summary: str = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
+    # Brownfield-only pre-flight scan state. Lives outside `agents` because
+    # the analyst isn't a Role and doesn't take orchestrator turns. The TUI
+    # consults these so the user can see discovery is in flight rather than
+    # mistaking a slow scan for a hang. discovery_started_at is monotonic
+    # (matches AgentState.thinking_started_at semantics).
+    discovery_status: Literal["none", "in_progress", "complete", "failed"] = "none"
+    discovery_started_at: Optional[float] = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "request": self.request,
             "workspace_root": self.workspace.root if self.workspace else None,
+            "workspace_code_dir_override": (
+                self.workspace.code_dir_override if self.workspace else None
+            ),
+            "workspace_brownfield": (
+                self.workspace.brownfield if self.workspace else False
+            ),
             "started_at": self.started_at,
             "finished": self.finished,
             "agents": {n: asdict(a) for n, a in self.agents.items()},

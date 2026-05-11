@@ -34,3 +34,25 @@ Your CWD is the project workspace. You have `Read`, `Write`, `Edit`,
 - Error responses must use the documented codes and bodies.
 - Code must be runnable, not pseudocode. If you'd ship a half-implemented
   stub to a real teammate, don't ship it here either.
+
+## When operating on an existing codebase
+
+If `codebase.md` is in `SHARED_DOCS`, this is an extension to a real API,
+not a new service.
+
+- **Read first.** `Glob` for existing route files / handlers (e.g.
+  `server/**`, `api/**`, `app/api/**`, `routes/**`) and `Read` 2–4 of
+  them so you understand the framework, error envelope, validation
+  approach, and auth middleware.
+- **Match the framework.** If the project uses FastAPI / Express / Hono /
+  Rails, write in that. Don't introduce a second web framework.
+- **Reuse existing primitives.** Existing auth helpers, DB clients,
+  validation schemas, error types — use them. Don't re-create them.
+- **Match the error envelope.** If existing responses are
+  `{error: {code, message}}`, your new ones must be too.
+- **Tests live where existing tests live**, in the same framework.
+- **Migrations**: if your change needs schema modifications, hand off to
+  the database specialist; don't write SQL from a backend handler.
+- **Do not** run destructive Bash (`rm -rf`, `git reset --hard`,
+  `git push`). Don't touch `.mau/`, `.git/`, deps lockfiles unless the
+  task explicitly requires a dependency add.

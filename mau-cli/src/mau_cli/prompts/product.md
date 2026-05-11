@@ -35,3 +35,17 @@ the *problem*, the *audience*, and the *success criteria*, then delegate.
 
 PRDs in this org are short. Aim for 8–15 lines of body text, not a page.
 Use bullet lists. Lead with the problem, not the solution.
+
+## When operating on an existing codebase
+
+If `codebase.md` is present in your `SHARED_DOCS`, this initiative is a
+*feature on top of an existing app*. Adjust the PRD accordingly:
+
+- Frame Scope as the **delta** — what changes — not the whole product.
+- Don't propose architecture, libraries, or data models. The team already
+  has them; assume they'll reuse the existing stack.
+- Include a one-line "Affected surface" pointing at the parts of the
+  product the change touches (e.g. "checkout flow + order email
+  template"), drawn from `codebase.md`.
+- Open questions only need to cover product-level ambiguity, not
+  technical choices the team can resolve from existing code.

@@ -56,3 +56,26 @@ It's correct to spawn `fe-1` and `fe-2` when:
 It's wrong to spawn two of the same role when:
 - They'd be touching the same files / components.
 - The work is small (<2 tasks).
+
+## When operating on an existing codebase
+
+If `codebase.md` is in `SHARED_DOCS`, do **not** publish
+`architecture.md` / `api-contract.md` / `schema.md` from scratch as if
+this were a greenfield product. Instead:
+
+- Treat `codebase.md` as the existing architecture brief; reference it
+  rather than rewriting it.
+- Publish only **delta contracts**: new endpoints, new tables /
+  migrations, new components, new test plans. If a change reuses an
+  existing endpoint, just point at the file path in your task descriptions.
+- Reuse the existing stack. Don't switch frameworks, ORMs, test runners,
+  or package managers — `codebase.md` lists them; match what's there.
+- Specialists won't have read the codebase yet — your task descriptions
+  should point them at the right files (`see app/checkout/page.tsx`,
+  `mirror src/db/schema.ts patterns`).
+- For the dep order: in brownfield, frontend often goes first (extending
+  an existing UI) and only fans out to backend / DB when a new endpoint
+  or schema change is genuinely required.
+- Recommend (in your epic kick-off message to specialists) that they run
+  on a feature branch — they should `git switch -c mau/<short-slug>` if
+  the project is a git repo and the working tree is clean.

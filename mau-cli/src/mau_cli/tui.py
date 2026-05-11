@@ -173,7 +173,17 @@ class TUI:
         in_flight = sum(
             1 for a in world.agents.values() if a.status == "thinking"
         )
-        if in_flight:
+        discovery_in_flight = world.discovery_status == "in_progress"
+        if discovery_in_flight:
+            elapsed = (
+                _time.monotonic() - world.discovery_started_at
+                if world.discovery_started_at else 0.0
+            )
+            title.append(
+                f"{self._spinner()} discovering codebase {_fmt_elapsed(elapsed)}",
+                style="bold yellow",
+            )
+        elif in_flight:
             title.append(f"{self._spinner()} {in_flight} in flight", style="bold yellow")
         else:
             title.append("idle", style="dim")
@@ -267,8 +277,12 @@ class TUI:
         if not world.agents:
             table.add_row(Text("(no agents yet)", style="dim"), "", "", "", "", "")
 
-        # Footer summary inside the team panel.
+        # Footer summary inside the team panel. Discovery is counted as in-flight
+        # work even though the analyst isn't an Agent — otherwise a slow
+        # pre-flight reads as "0 thinking" and looks like a hang.
         in_flight = sum(1 for a in world.agents.values() if a.status == "thinking")
+        if world.discovery_status == "in_progress":
+            in_flight += 1
         complete = sum(1 for a in world.agents.values() if a.status == "complete")
         summary = Text()
         summary.append(f"  {self._spinner()} ", style="bold yellow" if in_flight else "dim")
@@ -358,9 +372,24 @@ class TUI:
         last_event_age = _time.monotonic() - self._last_event_at
         uptime = _time.monotonic() - self._started_at
         in_flight_names = [a.name for a in world.agents.values() if a.status == "thinking"]
+        discovery_in_flight = world.discovery_status == "in_progress"
         heartbeat = Text(overflow="ellipsis", no_wrap=True)
-        heartbeat.append(f"{self._spinner()} ", style="bold yellow" if in_flight_names else "dim")
-        if in_flight_names:
+        active = bool(in_flight_names) or discovery_in_flight
+        heartbeat.append(f"{self._spinner()} ", style="bold yellow" if active else "dim")
+        if discovery_in_flight:
+            elapsed = (
+                _time.monotonic() - world.discovery_started_at
+                if world.discovery_started_at else 0.0
+            )
+            note = (
+                "  (real Claude scans take 30–90s; longer on big repos)"
+                if elapsed > 15 else ""
+            )
+            heartbeat.append(
+                f"discovering codebase {_fmt_elapsed(elapsed)}{note}",
+                style="yellow",
+            )
+        elif in_flight_names:
             heartbeat.append(
                 f"in flight: {', '.join(in_flight_names)}",
                 style="yellow",
