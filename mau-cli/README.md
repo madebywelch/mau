@@ -256,4 +256,4 @@ mau --max-budget 5.00 "Build a TODO API with auth"
 
 ## License
 
-MIT.
+Apache License 2.0. See [LICENSE](./LICENSE) for the full text.

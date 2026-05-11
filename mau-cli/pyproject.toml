@@ -9,7 +9,7 @@ description = "Multi-Agent Unit CLI — orchestrates a simulated engineering tea
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Robert Welch", email = "robert@madebywelch.com" }]
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = [
     "rich>=13.7",
     "click>=8.1",
