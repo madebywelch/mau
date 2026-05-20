@@ -19,23 +19,33 @@ from mau_cli.inference import InferenceBackend, InferenceResult
 from mau_cli.schemas import TokenUsage
 
 
-def _wrap_plan(parsed: dict[str, Any]) -> InferenceResult:
+def _wrap_plan(parsed: dict[str, Any], *, cost_usd: float = 0.0) -> InferenceResult:
     return InferenceResult(
         raw_text=json.dumps(parsed),
         parsed=parsed,
         backend="mock",
         duration_ms=10,
-        usage=TokenUsage(input_tokens=120, output_tokens=80, cost_usd=0.0, calls=1),
+        usage=TokenUsage(
+            input_tokens=120, output_tokens=80, cost_usd=cost_usd, calls=1
+        ),
     )
 
 
-def _wrap_agentic(text: str, deliverable: dict[str, Any], files: list[str]) -> InferenceResult:
+def _wrap_agentic(
+    text: str,
+    deliverable: dict[str, Any],
+    files: list[str],
+    *,
+    cost_usd: float = 0.0,
+) -> InferenceResult:
     return InferenceResult(
         raw_text=text,
         parsed=deliverable,
         backend="mock",
         duration_ms=20,
-        usage=TokenUsage(input_tokens=300, output_tokens=200, cost_usd=0.0, calls=1),
+        usage=TokenUsage(
+            input_tokens=300, output_tokens=200, cost_usd=cost_usd, calls=1
+        ),
         files_touched=files,
     )
 
@@ -53,6 +63,11 @@ def _detect_specialization(user_prompt: str) -> str:
 class MockBackend(InferenceBackend):
     name = "mock"
 
+    def __init__(self, *, cost_per_call_usd: float = 0.0):
+        # cost_per_call_usd lets tests simulate non-zero spend without standing
+        # up a real backend. Defaults to 0.0 so existing tests are unaffected.
+        self.cost_per_call_usd = cost_per_call_usd
+
     def available(self) -> bool:
         return True
 
@@ -61,12 +76,15 @@ class MockBackend(InferenceBackend):
     def call_plan(self, system_prompt: str, user_prompt: str) -> InferenceResult:
         role = _detect_role(system_prompt)
         if role == "product":
-            return _wrap_plan(self._product())
+            return _wrap_plan(self._product(), cost_usd=self.cost_per_call_usd)
         if role == "engineering_manager":
-            return _wrap_plan(self._em())
+            return _wrap_plan(self._em(), cost_usd=self.cost_per_call_usd)
         if role == "tech_lead":
-            return _wrap_plan(self._tl())
-        return _wrap_plan({"thoughts": "unknown role", "status": "complete", "actions": []})
+            return _wrap_plan(self._tl(), cost_usd=self.cost_per_call_usd)
+        return _wrap_plan(
+            {"thoughts": "unknown role", "status": "complete", "actions": []},
+            cost_usd=self.cost_per_call_usd,
+        )
 
     # ---- agentic mode ----------------------------------------------------
 
@@ -84,26 +102,30 @@ class MockBackend(InferenceBackend):
         ws.mkdir(parents=True, exist_ok=True)
 
         if role == "codebase_analyst":
-            return self._write_codebase_scan(ws, extra_dirs)
-        if role == "database":
-            return self._write_db(ws)
-        if role == "backend":
-            return self._write_be(ws)
-        if role == "frontend":
-            return self._write_fe(ws, spec)
-        if role == "qa":
-            return self._write_qa(ws)
-        if role == "devops":
-            return self._write_devops(ws)
-
-        # Fallback: drop a placeholder note
-        path = ws / f"NOTE-{role or 'agent'}.md"
-        path.write_text(f"# Mock {role} note\n\n{user_prompt[:200]}\n")
-        return _wrap_agentic(
-            f"Wrote {path}",
-            {"title": "note", "summary": "Mock placeholder.", "files_touched": [str(path.relative_to(ws))]},
-            [str(path.relative_to(ws))],
-        )
+            result = self._write_codebase_scan(ws, extra_dirs)
+        elif role == "database":
+            result = self._write_db(ws)
+        elif role == "backend":
+            result = self._write_be(ws)
+        elif role == "frontend":
+            result = self._write_fe(ws, spec)
+        elif role == "qa":
+            result = self._write_qa(ws)
+        elif role == "devops":
+            result = self._write_devops(ws)
+        else:
+            # Fallback: drop a placeholder note
+            path = ws / f"NOTE-{role or 'agent'}.md"
+            path.write_text(f"# Mock {role} note\n\n{user_prompt[:200]}\n")
+            result = _wrap_agentic(
+                f"Wrote {path}",
+                {"title": "note", "summary": "Mock placeholder.", "files_touched": [str(path.relative_to(ws))]},
+                [str(path.relative_to(ws))],
+            )
+        # Apply the configured per-call cost in a single funnel rather than
+        # threading the knob through every emitter helper.
+        result.usage.cost_usd = self.cost_per_call_usd
+        return result
 
     def _write_codebase_scan(
         self, ws: Path, extra_dirs: Optional[list[str]]

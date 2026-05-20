@@ -110,6 +110,7 @@ class Orchestrator:
         # from `_is_done` (which is polled on every loop iteration).
         self._turn_cap_announced = False
         self._completion_announced = False
+        self._budget_reached_announced = False
         # Number of accepted deliverables; gates periodic codebase refresh.
         self._landed_deliverables = 0
 
@@ -326,7 +327,12 @@ class Orchestrator:
                         f"Halted: max-budget ${self.max_budget_usd:.2f} reached "
                         f"(spent ${self.world.usage.cost_usd:.4f})."
                     )
-                    self._emit("budget_reached", {"spent": self.world.usage.cost_usd})
+                    if not self._budget_reached_announced:
+                        self._emit(
+                            "budget_reached",
+                            {"spent": self.world.usage.cost_usd},
+                        )
+                        self._budget_reached_announced = True
                     break
                 progressed = self._tick()
                 self._persist()
@@ -522,6 +528,21 @@ class Orchestrator:
 
     def _tick(self) -> bool:
         """Run one batch of concurrent turns. Returns True if any agent acted."""
+        # Pre-flight budget check: refuse to dispatch any new turn if we're
+        # already at/over the cap. The post-turn check in _main_loop only
+        # fires AFTER a turn lands, by which point a $1+ call can have piled
+        # onto an already-met cap. The dispatch-time gate ensures no fresh
+        # turn starts after `total_cost_usd >= max_budget_usd`. In-flight
+        # turns from a prior tick still complete; spend can overshoot
+        # slightly because of them, but no new expensive turn gets queued.
+        if self._over_budget():
+            if not self._budget_reached_announced:
+                self._emit(
+                    "budget_reached", {"spent": self.world.usage.cost_usd}
+                )
+                self._budget_reached_announced = True
+            return False
+
         ready: list[Agent] = self._ready_agents()
         if not ready:
             return False
