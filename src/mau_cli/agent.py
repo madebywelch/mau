@@ -130,6 +130,36 @@ class Agent:
                     lines.append(content)
             lines.append("")
 
+        # Durable policies — human-approval rules captured via record_policy
+        # (or the --policy CLI flag). Re-rendered every turn so rules survive
+        # across turns and resumes. Matched by scope: global always shows;
+        # role:<role> shows when this agent's role matches; task:<id> shows
+        # when this agent has that task open.
+        my_open_tasks = {
+            tid for tid in s.assigned_tasks
+            if tid in world.tasks and world.tasks[tid].status != "complete"
+        }
+        scope_filters = [f"role:{s.role.value}"] + [f"task:{tid}" for tid in my_open_tasks]
+        matching: list = list(world.active_policies())  # globals
+        seen_ids = {p.id for p in matching}
+        for scope in scope_filters:
+            for p in world.active_policies(scope):
+                if p.id not in seen_ids:
+                    matching.append(p)
+                    seen_ids.add(p.id)
+        if matching:
+            lines.append("### Active policies")
+            lines.append(
+                "  (Durable rules the user — or a teammate — recorded. They "
+                "OVERRIDE your default judgment. If a policy conflicts with "
+                "a task, flag it via send_message rather than violate it.)"
+            )
+            for p in matching:
+                lines.append(
+                    f"  - [{p.id}] (scope={p.scope}, source={p.source}) {p.text}"
+                )
+            lines.append("")
+
         my_tasks = [world.tasks[tid] for tid in s.assigned_tasks if tid in world.tasks]
         if my_tasks:
             lines.append("YOUR_TASKS:")

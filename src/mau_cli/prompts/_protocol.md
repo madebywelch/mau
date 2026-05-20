@@ -133,6 +133,27 @@ types listed here are valid; unknown types are ignored.
     "verifier": "run_command",
     "spec": { "command": "pytest -q", "timeout_seconds": 60 } }
   ```
+- `record_policy` — promote a rule the user (or your team) has agreed on
+  into durable harness state. Every future agent prompt re-renders matching
+  policies in an `### Active policies` section, so the team won't forget the
+  rule the moment the conversation scrolls. Use this when a user answer
+  contains a guardrail ("never deploy without a migration plan"), when a
+  retrospective produces a permanent norm, or when you and a teammate
+  ratify a convention you want everyone bound to.
+  ```
+  { "type": "record_policy",
+    "text": "always run db migration plan before deploy",
+    "scope": "global"            // or "role:devops", or "task:task_abc123"
+  }
+  ```
+  Scope defaults to `global` if omitted. The orchestrator stamps `source`
+  with your agent name and emits a `policy_recorded` event. Dedup is on
+  exact `(text, scope)` — re-recording the same rule is a no-op.
+- `retire_policy` — mark a previously recorded policy inactive. It stays
+  in the audit trail (`active=false`) but stops appearing in prompts.
+  ```
+  { "type": "retire_policy", "policy_id": "pol_xxxxxxxx" }
+  ```
 - `check_criterion` — re-run one acceptance criterion's verifier on demand.
   Useful when you want to spot-check a single criterion mid-task or confirm
   a fix landed without re-running the whole task's deliverable.

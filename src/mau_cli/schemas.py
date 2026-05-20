@@ -156,6 +156,27 @@ class DocVersion:
 
 
 @dataclass
+class Policy:
+    """A durable human-approval rule that every future agent prompt re-sees.
+
+    Promoted from one-shot `ask_user` answers (and CLI --policy flags) into
+    first-class WorldState so the team doesn't forget "never deploy without
+    a migration plan" the moment the question scrolls off the inbox. Persists
+    across turns and across `--resume`. Contrast with the orchestrator's
+    ephemeral `_turn_cap_announced` / `_completion_announced` /
+    `_rejected_this_turn` flags, which are intentionally not snapshotted —
+    those are per-tick guards, not durable governance state."""
+
+    id: str = field(default_factory=lambda: _id("pol"))
+    text: str = ""
+    scope: str = "global"  # "global" | "role:<role>" | "task:<task_id>"
+    source: str = "user"  # agent name or "user"
+    created_at: str = field(default_factory=now_iso)
+    created_turn: int = 0
+    active: bool = True
+
+
+@dataclass
 class Task:
     id: str = field(default_factory=lambda: _id("task"))
     title: str = ""
@@ -260,6 +281,8 @@ ActionType = Literal[
     "verify",
     "check_criterion",
     "write_doc",
+    "record_policy",
+    "retire_policy",
 ]
 
 
@@ -360,6 +383,10 @@ class WorldState:
     # name → version history, newest last. All writers must go through
     # put_doc; readers wanting the latest go through get_doc.
     shared_docs: dict[str, list[DocVersion]] = field(default_factory=dict)
+    # Durable human-approval rules. See Policy docstring; agent.py injects
+    # the matching subset into every prompt so rules survive across turns
+    # and across `--resume`.
+    policies: list[Policy] = field(default_factory=list)
     pending_user_questions: list[Message] = field(default_factory=list)
     log: list[str] = field(default_factory=list)  # human-readable event log
     started_at: float = field(default_factory=now)
@@ -381,6 +408,47 @@ class WorldState:
     def get_doc_version(self, name: str) -> Optional[DocVersion]:
         versions = self.shared_docs.get(name)
         return versions[-1] if versions else None
+
+    def active_policies(
+        self, scope_filter: Optional[str] = None
+    ) -> list["Policy"]:
+        """Return active policies visible under `scope_filter`. `global` is
+        always returned. When `scope_filter` is None, only globals match.
+
+        For `role:<role>` filters, a policy with scope `role:<role>` matches.
+        For `task:<task_id>` filters, a policy with scope `task:<task_id>`
+        matches. Exact match on the rest; no wildcards. The ordering matches
+        insertion order so prompts render deterministically across reruns."""
+        out: list[Policy] = []
+        for p in self.policies:
+            if not p.active:
+                continue
+            if p.scope == "global":
+                out.append(p)
+                continue
+            if scope_filter is not None and p.scope == scope_filter:
+                out.append(p)
+        return out
+
+    def add_policy(
+        self, text: str, scope: str, source: str, turn: int
+    ) -> "Policy":
+        """Append and return a new Policy. If an active policy with the same
+        (text, scope) already exists, return the existing one — dedupes the
+        common case of the user passing --policy on resume."""
+        text = text.strip()
+        scope = (scope or "global").strip() or "global"
+        for existing in self.policies:
+            if existing.active and existing.text == text and existing.scope == scope:
+                return existing
+        policy = Policy(
+            text=text,
+            scope=scope,
+            source=source or "user",
+            created_turn=turn,
+        )
+        self.policies.append(policy)
+        return policy
 
     def put_doc(
         self, name: str, content: str, author: str, turn: int
@@ -418,6 +486,7 @@ class WorldState:
                 name: [asdict(v) for v in versions]
                 for name, versions in self.shared_docs.items()
             },
+            "policies": [asdict(p) for p in self.policies],
             "log": list(self.log),
             "final_summary": self.final_summary,
             "usage": asdict(self.usage),

@@ -31,6 +31,7 @@ from mau_cli.schemas import (
     AgentTurn,
     DocVersion,
     Message,
+    Policy,
     ROLES_THAT_SPAWN,
     Role,
     SUPERVISOR_OF,
@@ -327,6 +328,7 @@ class Orchestrator:
 
         self.world.request = snapshot.get("request", "") or self.world.request
         self._rehydrate_shared_docs(snapshot.get("shared_docs") or {})
+        self._rehydrate_policies(snapshot.get("policies") or [])
 
         usage_d = snapshot.get("usage") or {}
         self.world.usage = TokenUsage(
@@ -416,6 +418,34 @@ class Orchestrator:
                 )
             if versions:
                 self.world.shared_docs[name] = versions
+
+    def _rehydrate_policies(self, raw: Any) -> None:
+        """Restore policies from a snapshot. Tolerant of missing/legacy keys
+        so pre-Task-5 session.json files resume cleanly (default to no
+        policies)."""
+        if not isinstance(raw, list):
+            return
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text", "")).strip()
+            if not text:
+                continue
+            try:
+                created_turn = int(entry.get("created_turn") or 0)
+            except (TypeError, ValueError):
+                created_turn = 0
+            self.world.policies.append(
+                Policy(
+                    id=str(entry.get("id") or _id("pol")),
+                    text=text,
+                    scope=str(entry.get("scope") or "global"),
+                    source=str(entry.get("source") or "user"),
+                    created_at=str(entry.get("created_at") or now_iso()),
+                    created_turn=created_turn,
+                    active=bool(entry.get("active", True)),
+                )
+            )
 
     def _over_budget(self) -> bool:
         if self.max_budget_usd is None:
@@ -852,6 +882,62 @@ class Orchestrator:
 
         elif action_type == "note":
             agent.state.notes.append(str(action.get("body", ""))[:500])
+
+        elif action_type == "record_policy":
+            text = str(action.get("text", "")).strip()
+            if not text:
+                self._emit(
+                    "record_policy_invalid",
+                    {"agent": agent.state.name, "reason": "empty text"},
+                )
+                return
+            scope = str(action.get("scope", "global")).strip() or "global"
+            before = len(self.world.policies)
+            policy = self.world.add_policy(
+                text=text,
+                scope=scope,
+                source=agent.state.name,
+                turn=self._global_turns,
+            )
+            self._emit(
+                "policy_recorded",
+                {
+                    "agent": agent.state.name,
+                    "id": policy.id,
+                    "text": policy.text,
+                    "scope": policy.scope,
+                    "source": policy.source,
+                    "deduped": len(self.world.policies) == before,
+                },
+            )
+
+        elif action_type == "retire_policy":
+            policy_id = str(action.get("policy_id", "")).strip()
+            target: Optional[Policy] = None
+            for p in self.world.policies:
+                if p.id == policy_id:
+                    target = p
+                    break
+            if target is None or not target.active:
+                self._emit(
+                    "retire_policy_invalid",
+                    {
+                        "agent": agent.state.name,
+                        "policy_id": policy_id,
+                        "reason": "unknown or already retired",
+                    },
+                )
+                return
+            target.active = False
+            self._emit(
+                "policy_retired",
+                {
+                    "agent": agent.state.name,
+                    "id": target.id,
+                    "scope": target.scope,
+                    "text": target.text,
+                },
+            )
 
         elif action_type == "verify":
             self._dispatch_verify(agent, action)

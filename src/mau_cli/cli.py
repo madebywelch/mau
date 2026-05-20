@@ -107,6 +107,15 @@ SPLASH = r"""
     type=click.Path(dir_okay=False, writable=True),
     help="Also persist a final session JSON to this extra path (in addition to <workspace>/session.json).",
 )
+@click.option(
+    "--policy",
+    "policies",
+    multiple=True,
+    help="Durable policy the team must follow for this run (and resumes). "
+    "Repeatable. Format: '<rule>' for global, or 'role:<role>=<rule>' / "
+    "'task:<id>=<rule>' to scope. e.g. --policy 'no force-pushes to main' "
+    "--policy 'role:devops=always run db migration plan before deploy'.",
+)
 @click.version_option(version=__version__, prog_name="mau")
 def main(
     request: tuple[str, ...],
@@ -120,6 +129,7 @@ def main(
     max_budget_usd: Optional[float],
     no_tui: bool,
     save: Optional[str],
+    policies: tuple[str, ...],
 ) -> None:
     console = Console()
     console.print(Text(SPLASH.format(version=__version__), style="bold cyan"))
@@ -207,6 +217,7 @@ def main(
                     f"[bold]Agents:[/bold]   {len(orch.agents)} restored\n"
                     f"[bold]Tasks:[/bold]    {len(orch.world.tasks)} restored\n"
                     f"[bold]Messages:[/bold] {len(orch.world.messages)} replayed\n"
+                    f"[bold]Policies:[/bold] {sum(1 for p in orch.world.policies if p.active)} active\n"
                     f"[bold]Spent:[/bold]    {orch.world.usage.short()}"
                 ),
                 border_style="green",
@@ -216,6 +227,16 @@ def main(
         if not rehydrated:
             console.print("[red]Session state had no agents — nothing to resume.[/red]")
             sys.exit(1)
+
+    # Atomically seed --policy entries before the team starts (or resumes).
+    # add_policy dedupes on (text, scope), so re-passing the same flag on
+    # resume is a no-op rather than duplicating the rule.
+    for raw in policies:
+        text, scope = _parse_policy_flag(raw)
+        if not text:
+            console.print(f"[yellow]Skipping empty --policy entry: {raw!r}[/yellow]")
+            continue
+        orch.world.add_policy(text=text, scope=scope, source="user", turn=0)
 
     try:
         if no_tui:
@@ -255,9 +276,31 @@ def main(
                 "\n".join(
                     f"[{m.from_agent}] {m.subject}\n  {m.body}"
                     for m in world.pending_user_questions
-                ),
+                )
+                + "\n\nTip: if your answer is a rule the team should follow "
+                + "going forward, resume with `mau --resume --policy '<rule>'` "
+                + "(or `--policy 'role:devops=<rule>'`) so the rule persists "
+                + "into every future agent prompt.",
                 title="[bold yellow]escalations / questions for you[/bold yellow]",
                 border_style="yellow",
+            )
+        )
+
+    active_policies = [p for p in world.policies if p.active]
+    if active_policies:
+        # Use Text (not a markup string) so policy IDs in square brackets
+        # aren't interpreted as Rich markup tags.
+        body = Text(
+            "\n".join(
+                f"  - [{p.id}] (scope={p.scope}, source={p.source}) {p.text}"
+                for p in active_policies
+            )
+        )
+        console.print(
+            Panel(
+                body,
+                title="[bold]active policies[/bold]",
+                border_style="cyan",
             )
         )
 
@@ -265,6 +308,28 @@ def main(
         path = Path(save)
         path.write_text(json.dumps(world.snapshot(), indent=2, default=str))
         console.print(f"[dim]session saved to {path}[/dim]")
+
+
+def _parse_policy_flag(raw: str) -> tuple[str, str]:
+    """Parse one --policy value into (text, scope).
+
+    Accepts:
+      'rule text'                       → ('rule text', 'global')
+      'role:devops=rule text'           → ('rule text', 'role:devops')
+      'task:task_abc123=rule text'      → ('rule text', 'task:task_abc123')
+      'global=rule text'                → ('rule text', 'global')
+    Returns ('', 'global') for whitespace-only input."""
+    s = raw.strip()
+    if not s:
+        return "", "global"
+    head, sep, rest = s.partition("=")
+    if sep and head.strip() and (
+        head.strip() == "global"
+        or head.strip().startswith("role:")
+        or head.strip().startswith("task:")
+    ):
+        return rest.strip(), head.strip()
+    return s, "global"
 
 
 def _interactive_prompt(console: Console) -> str:
