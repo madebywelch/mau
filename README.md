@@ -244,6 +244,16 @@ and stages the proposed diff there — your source tree is never mutated.
   than the prototype's "patch staged" record.
 - **Single-binary distribution.** Rewrite in Go with bubbletea TUI.
 
+## Running the tests
+
+The regression suite lives under `tests/` and runs against the deterministic
+mock backend — no network, no spend. Pytest is an optional dev dependency.
+
+```bash
+pip install -e .[dev]
+PYTHONPATH=src python3 -m pytest -q tests/
+```
+
 ## Contributing
 
 Issues and PRs welcome. The codebase is small enough to read end-to-end —
