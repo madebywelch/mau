@@ -101,6 +101,18 @@ types listed here are valid; unknown types are ignored.
   ```
   { "type": "write_doc", "name": "api-contract.md", "content": "<full content>" }
   ```
+  **Versioning**: every `write_doc` (and the brownfield codebase scan) is
+  appended as a new version with a short content hash, author, and turn
+  number. The header you see in `SHARED_DOCS` looks like
+  `--- api-contract.md [version=ab12cd34… author=tech-lead-1 turn=7] ---`.
+  Republishing the same content is deduped — `write_doc` with byte-identical
+  content is a no-op. When a downstream specialist emits a `deliverable`,
+  the orchestrator records onto the closing task which doc versions the
+  agent's prompt actually contained (`satisfied_doc_versions`), so the
+  audit trail can answer "did Task X close against the latest contract?".
+  If your prompt's `SHARED_DOCS` header shows a version hash older than the
+  one a teammate just published, you are working against a stale copy —
+  re-read before claiming done.
 - `verify` — invoke a deterministic sensor against the workspace. On
   failure the orchestrator delivers a `blocker` back to you (same channel
   as a rejected deliverable) and the turn is marked rejected, so any

@@ -25,6 +25,14 @@ from mau_cli.schemas import (
 )
 
 
+# Per-doc cap in characters when injecting shared docs into a prompt.
+# Set generously (~60k chars ≈ ~15k tokens) so agents see the full text the
+# overwhelming majority of the time, while still bounding catastrophic-size
+# blowups. When a doc exceeds this, the prompt prepends a clear marker so
+# the agent knows it's looking at a truncated copy.
+SHARED_DOC_HARD_CAP = 60_000
+
+
 def load_role_prompt(role: Role) -> str:
     pkg = "mau_cli.prompts"
     protocol = resources.files(pkg).joinpath("_protocol.md").read_text(encoding="utf-8")
@@ -42,6 +50,11 @@ class Agent:
         # prompt+response pair without changing AgentTurn's shape.
         self.last_prompt: str = ""
         self.last_result: InferenceResult | None = None
+        # name → hash of the doc version this agent saw in its last prompt.
+        # Snapshotted onto Tasks when this agent's deliverable lands, so
+        # later analysis can see which version of each contract the
+        # deliverable was satisfied against.
+        self.last_doc_versions: dict[str, str] = {}
 
     # ---- prompt construction --------------------------------------------
 
@@ -88,14 +101,31 @@ class Agent:
         lines.append("")
 
         # Shared docs are *the* coordination artifact. Specialists read them
-        # to learn the contract; planners write them to publish it.
+        # to learn the contract; planners write them to publish it. We inject
+        # the full latest content plus the version hash so every agent sees
+        # the same mental copy and stale-version blunders are detectable.
+        self.last_doc_versions = {}
         if world.shared_docs:
             lines.append("SHARED_DOCS:")
-            for name, content in world.shared_docs.items():
-                lines.append(f"  --- {name} ---")
-                # Truncate generously; specialists need full content.
-                if len(content) > 4000:
-                    lines.append(content[:4000] + "\n…[truncated]")
+            for name in world.shared_docs:
+                version = world.get_doc_version(name)
+                if version is None:
+                    continue
+                self.last_doc_versions[name] = version.hash
+                header = (
+                    f"  --- {name} "
+                    f"[version={version.hash} author={version.author} "
+                    f"turn={version.turn}] ---"
+                )
+                lines.append(header)
+                content = version.content
+                if len(content) > SHARED_DOC_HARD_CAP:
+                    lines.append(
+                        f"  [WARNING: doc exceeds {SHARED_DOC_HARD_CAP} chars and "
+                        f"was truncated; version hash above identifies the full "
+                        f"copy on disk at shared/{name}]"
+                    )
+                    lines.append(content[:SHARED_DOC_HARD_CAP] + "\n…[truncated]")
                 else:
                     lines.append(content)
             lines.append("")

@@ -14,6 +14,7 @@ Design notes:
 
 from __future__ import annotations
 
+import difflib
 import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -28,6 +29,7 @@ from mau_cli.schemas import (
     AcceptanceCriterion,
     AgentState,
     AgentTurn,
+    DocVersion,
     Message,
     ROLES_THAT_SPAWN,
     Role,
@@ -36,8 +38,10 @@ from mau_cli.schemas import (
     TokenUsage,
     Workspace,
     WorldState,
+    _doc_hash,
     _id,
     now,
+    now_iso,
 )
 from mau_cli.verifiers import VERIFIERS, VerifierResult
 
@@ -48,6 +52,14 @@ DEFAULT_MAX_AGENTS = 12
 DEFAULT_CONCURRENCY = 3
 ESCALATION_AFTER_BLOCKED_TURNS = 3
 MAX_TURNS_PER_AGENT = 12  # safety cap per agent to avoid runaway loops
+
+# Re-scan the codebase and re-publish shared/codebase.md every N landed
+# deliverables in brownfield mode. The paper calls out that one-shot scans
+# decay — refreshing this keeps agents from reading a stale map as ground
+# truth. put_doc dedups by hash so a no-change scan is a no-op.
+CODEBASE_REFRESH_EVERY_DELIVERABLES = 10
+DIFF_PREVIEW_LINES = 40
+NEW_DOC_PREVIEW_LINES = 20
 
 
 class Orchestrator:
@@ -86,6 +98,8 @@ class Orchestrator:
         # from `_is_done` (which is polled on every loop iteration).
         self._turn_cap_announced = False
         self._completion_announced = False
+        # Number of accepted deliverables; gates periodic codebase refresh.
+        self._landed_deliverables = 0
 
         # Per-agent transcript directory. Defaults to <workspace>/logs/ so
         # AHE / Evolution-Agent tooling has prompt+response tapes to chew on.
@@ -108,7 +122,7 @@ class Orchestrator:
         if (
             self.world.workspace is not None
             and self.world.workspace.brownfield
-            and "codebase.md" not in self.world.shared_docs
+            and self.world.get_doc("codebase.md") is None
         ):
             self._discover_codebase()
 
@@ -127,9 +141,26 @@ class Orchestrator:
     def _discover_codebase(self) -> None:
         """Brownfield-only pre-flight: scan the existing project and write
         codebase.md into shared_docs so all subsequent agents see it."""
+        self._run_codebase_scan(reason="initial")
+
+    def refresh_codebase_map(self, force: bool = False) -> Optional[DocVersion]:
+        """Re-run the brownfield codebase scan and publish a fresh version of
+        codebase.md. Returns the published DocVersion, or None if the scan
+        was skipped/failed. If the new scan is byte-identical to the previous
+        version, put_doc dedups and no new version is appended (the existing
+        one is returned).
+
+        `force` is currently unused — put_doc's hash-dedup makes redundant
+        scans cheap on the harness side, but the caller still pays the
+        analyst's inference cost, so callers typically gate themselves."""
+        if self.world.workspace is None or not self.world.workspace.brownfield:
+            return None
+        return self._run_codebase_scan(reason="refresh")
+
+    def _run_codebase_scan(self, *, reason: str) -> Optional[DocVersion]:
         ws = self.world.workspace
         if ws is None:
-            return
+            return None
         try:
             system = (
                 resources.files("mau_cli.prompts")
@@ -138,7 +169,7 @@ class Orchestrator:
             )
         except FileNotFoundError:
             self._emit("discovery_skipped", {"reason": "analyst prompt not found"})
-            return
+            return None
 
         shared_path = Path(ws.shared_dir) / "codebase.md"
         user_prompt = (
@@ -151,7 +182,7 @@ class Orchestrator:
         self.world.discovery_status = "in_progress"
         self.world.discovery_started_at = _t.monotonic()
         self._persist()
-        self._emit("discovery_start", {"project_root": ws.code_dir})
+        self._emit("discovery_start", {"project_root": ws.code_dir, "reason": reason})
         try:
             result = self.backend.call_agentic(
                 system_prompt=system,
@@ -163,29 +194,36 @@ class Orchestrator:
         except Exception as e:
             self.world.discovery_status = "failed"
             self.world.discovery_started_at = None
-            self._emit("discovery_error", {"error": str(e)})
-            return
+            self._emit("discovery_error", {"error": str(e), "reason": reason})
+            return None
 
         self.world.usage.add(result.usage)
-        if shared_path.exists():
-            try:
-                self.world.shared_docs["codebase.md"] = shared_path.read_text(
-                    encoding="utf-8"
-                )
-                self.world.discovery_status = "complete"
-                self.world.discovery_started_at = None
-                self._emit(
-                    "discovery_complete",
-                    {"size": len(self.world.shared_docs["codebase.md"])},
-                )
-            except OSError as e:
-                self.world.discovery_status = "failed"
-                self.world.discovery_started_at = None
-                self._emit("discovery_read_error", {"error": str(e)})
-        else:
+        if not shared_path.exists():
             self.world.discovery_status = "failed"
             self.world.discovery_started_at = None
-            self._emit("discovery_no_output", {"path": str(shared_path)})
+            self._emit("discovery_no_output", {"path": str(shared_path), "reason": reason})
+            return None
+        try:
+            content = shared_path.read_text(encoding="utf-8")
+        except OSError as e:
+            self.world.discovery_status = "failed"
+            self.world.discovery_started_at = None
+            self._emit("discovery_read_error", {"error": str(e), "reason": reason})
+            return None
+
+        version = self._publish_doc(
+            name="codebase.md",
+            content=content,
+            author="system",
+            persist_to_disk=False,  # analyst already wrote shared_path itself
+        )
+        self.world.discovery_status = "complete"
+        self.world.discovery_started_at = None
+        self._emit(
+            "discovery_complete",
+            {"size": len(content), "reason": reason, "hash": version.hash},
+        )
+        return version
 
     def resume(self, fallback_request: Optional[str] = None) -> WorldState:
         """Continue an existing session. World state has already been
@@ -198,7 +236,10 @@ class Orchestrator:
             self.world.request = request
             self._emit(
                 "session_soft_resume",
-                {"request": request, "shared_docs": list(self.world.shared_docs.keys())},
+                {
+                    "request": request,
+                    "shared_docs": list(self.world.shared_docs.keys()),
+                },
             )
             product = self._spawn_agent(Role.PRODUCT, "product-1", "")
             self.bus.deliver(
@@ -271,15 +312,21 @@ class Orchestrator:
             for f in sorted(shared_dir.iterdir()):
                 if f.is_file() and not f.name.startswith("."):
                     try:
-                        self.world.shared_docs[f.name] = f.read_text(encoding="utf-8")
+                        content = f.read_text(encoding="utf-8")
                     except Exception:
-                        pass
+                        continue
+                    self.world.put_doc(
+                        name=f.name,
+                        content=content,
+                        author="disk",
+                        turn=0,
+                    )
 
         if not snapshot:
             return False
 
         self.world.request = snapshot.get("request", "") or self.world.request
-        self.world.shared_docs.update(snapshot.get("shared_docs") or {})
+        self._rehydrate_shared_docs(snapshot.get("shared_docs") or {})
 
         usage_d = snapshot.get("usage") or {}
         self.world.usage = TokenUsage(
@@ -301,6 +348,7 @@ class Orchestrator:
                     depends_on=list(t.get("depends_on") or []),
                     acceptance_criteria=list(t.get("acceptance_criteria") or []),
                     deliverable_summary=t.get("deliverable_summary"),
+                    satisfied_doc_versions=dict(t.get("satisfied_doc_versions") or {}),
                     created_at=float(t.get("created_at") or now()),
                     updated_at=float(t.get("updated_at") or now()),
                 )
@@ -327,6 +375,47 @@ class Orchestrator:
             self.agents[name] = Agent(state, self.backend)
 
         return bool(self.agents) or bool(self.world.tasks)
+
+    def _rehydrate_shared_docs(self, raw: Any) -> None:
+        """Restore shared_docs from a snapshot. Tolerates both the new
+        list[DocVersion] shape and the legacy dict[str, str] shape so existing
+        on-disk sessions can resume without manual migration."""
+        if not isinstance(raw, dict):
+            return
+        for name, value in raw.items():
+            if isinstance(value, str):
+                self.world.shared_docs[name] = [
+                    DocVersion(
+                        content=value,
+                        hash=_doc_hash(value),
+                        author="legacy",
+                        timestamp=now_iso(),
+                        turn=0,
+                    )
+                ]
+                continue
+            if not isinstance(value, list):
+                continue
+            versions: list[DocVersion] = []
+            for entry in value:
+                if not isinstance(entry, dict):
+                    continue
+                content = str(entry.get("content", ""))
+                try:
+                    turn = int(entry.get("turn") or 0)
+                except (TypeError, ValueError):
+                    turn = 0
+                versions.append(
+                    DocVersion(
+                        content=content,
+                        hash=str(entry.get("hash") or _doc_hash(content)),
+                        author=str(entry.get("author") or "unknown"),
+                        timestamp=str(entry.get("timestamp") or now_iso()),
+                        turn=turn,
+                    )
+                )
+            if versions:
+                self.world.shared_docs[name] = versions
 
     def _over_budget(self) -> bool:
         if self.max_budget_usd is None:
@@ -694,6 +783,8 @@ class Orchestrator:
                     if files:
                         summary = f"{summary} (files: {', '.join(files)})"
                     task.deliverable_summary = summary
+                    if agent.last_doc_versions:
+                        task.satisfied_doc_versions = dict(agent.last_doc_versions)
                     self.bus.deliver(
                         Message(
                             from_agent=agent.state.name,
@@ -723,6 +814,8 @@ class Orchestrator:
                             body=str(action.get("summary", "")),
                         )
                     )
+            self._landed_deliverables += 1
+            self._maybe_refresh_codebase_map()
 
         elif action_type == "write_doc":
             name = str(action.get("name", "")).strip()
@@ -730,12 +823,7 @@ class Orchestrator:
             if not name:
                 self._emit("write_doc_invalid", {"agent": agent.state.name})
                 return
-            self.world.shared_docs[name] = content
-            if self.world.workspace is not None:
-                path = Path(self.world.workspace.shared_dir) / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-            self._emit("doc_written", {"agent": agent.state.name, "name": name, "len": len(content)})
+            self._publish_doc(name=name, content=content, author=agent.state.name)
 
         elif action_type == "escalate":
             self._escalate(agent, str(action.get("reason", "no reason given")))
@@ -850,6 +938,67 @@ class Orchestrator:
                 ),
             )
         )
+
+    def _maybe_refresh_codebase_map(self) -> None:
+        """In brownfield mode, periodically re-run the codebase scan so the
+        shared map doesn't decay as agents restructure the project. No-op in
+        greenfield (no existing project to map). put_doc dedups by hash, so
+        a no-change scan doesn't pile up duplicate versions in shared_docs."""
+        if self.world.workspace is None or not self.world.workspace.brownfield:
+            return
+        if CODEBASE_REFRESH_EVERY_DELIVERABLES <= 0:
+            return
+        if self._landed_deliverables % CODEBASE_REFRESH_EVERY_DELIVERABLES != 0:
+            return
+        try:
+            self.refresh_codebase_map()
+        except Exception as e:
+            self._emit("codebase_refresh_error", {"error": str(e)})
+
+    # ---- shared-doc publishing ------------------------------------------
+
+    def _publish_doc(
+        self,
+        *,
+        name: str,
+        content: str,
+        author: str,
+        persist_to_disk: bool = True,
+    ) -> DocVersion:
+        """Single funnel for every write into world.shared_docs.
+
+        Versions via WorldState.put_doc (hash-dedups), mirrors the latest
+        content to <workspace>/shared/<name> for tools that Read the file
+        directly, and emits a `doc_updated` event so the TUI / transcript
+        can show a unified diff of what changed."""
+        prev = self.world.get_doc_version(name)
+        version = self.world.put_doc(
+            name=name, content=content, author=author, turn=self._global_turns
+        )
+        if version is prev:
+            # No-op republish — dedup'd, nothing to broadcast.
+            return version
+        if persist_to_disk and self.world.workspace is not None:
+            try:
+                path = Path(self.world.workspace.shared_dir) / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            except OSError as e:
+                self._emit("doc_write_disk_error", {"name": name, "error": str(e)})
+        self._emit(
+            "doc_updated",
+            {
+                "name": name,
+                "new_hash": version.hash,
+                "prev_hash": prev.hash if prev else None,
+                "author": author,
+                "turn": version.turn,
+                "diff_preview": _doc_diff_preview(
+                    prev.content if prev else None, content
+                ),
+            },
+        )
+        return version
 
     # ---- criterion checking ---------------------------------------------
 
@@ -1205,6 +1354,31 @@ class Orchestrator:
 
 
 # ---- module-level snapshot helpers ----------------------------------------
+
+
+def _doc_diff_preview(prev: Optional[str], new: str) -> str:
+    """Short, human-readable diff preview for the `doc_updated` event.
+
+    For an entirely new doc, return the first NEW_DOC_PREVIEW_LINES lines.
+    Otherwise, a unified diff truncated to DIFF_PREVIEW_LINES lines."""
+    if prev is None:
+        head = new.splitlines()[:NEW_DOC_PREVIEW_LINES]
+        return "\n".join(head)
+    diff = difflib.unified_diff(
+        prev.splitlines(),
+        new.splitlines(),
+        fromfile="prev",
+        tofile="new",
+        lineterm="",
+        n=2,
+    )
+    out: list[str] = []
+    for i, line in enumerate(diff):
+        if i >= DIFF_PREVIEW_LINES:
+            out.append(f"…[diff truncated after {DIFF_PREVIEW_LINES} lines]")
+            break
+        out.append(line)
+    return "\n".join(out)
 
 
 def _format_criteria_inline(criteria: list[AcceptanceCriterion]) -> str:
