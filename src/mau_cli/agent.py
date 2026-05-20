@@ -111,7 +111,12 @@ class Agent:
                         lines.append(f"      {d_line}")
                 if t.acceptance_criteria:
                     for ac in t.acceptance_criteria:
-                        lines.append(f"      ✓ {ac}")
+                        prefix = f"      ✓ {ac.text}"
+                        if ac.verifier:
+                            prefix += (
+                                f" [verifier={ac.verifier}, status={ac.last_status}]"
+                            )
+                        lines.append(prefix)
             lines.append("")
 
         if s.inbox:

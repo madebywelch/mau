@@ -32,6 +32,16 @@ own the technical decomposition.
 - Spawning multiple Tech Leads for one epic.
 - Decomposing into engineer-level tasks yourself instead of delegating.
 
+## A note on acceptance criteria
+
+If you do create high-level tasks yourself (typical: a single roll-up task
+for the Tech Lead), each item in `acceptance_criteria` can be either a
+plain string OR a structured object with a `verifier` and `spec`. Prefer
+the structured form for anything you'd want the orchestrator to objectively
+check — see the Tech Lead prompt for the shape and the registry of
+verifiers. The run won't be marked complete until every verifier-bearing
+criterion has passed.
+
 ## When operating on an existing codebase
 
 If `codebase.md` is in `SHARED_DOCS`, scope work streams to the **delta

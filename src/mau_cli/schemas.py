@@ -60,6 +60,7 @@ MessageType = Literal[
     "directive",
 ]
 TaskStatus = Literal["pending", "in_progress", "blocked", "complete", "cancelled"]
+CriterionStatus = Literal["pending", "passed", "failed"]
 
 
 def _id(prefix: str) -> str:
@@ -86,6 +87,52 @@ class Message:
 
 
 @dataclass
+class AcceptanceCriterion:
+    """A single acceptance criterion. `text` is the human-readable form; if
+    `verifier` is set, the orchestrator can run it against the workspace and
+    record the outcome in `last_*`."""
+
+    text: str = ""
+    verifier: Optional[str] = None  # name in verifiers.VERIFIERS
+    spec: Optional[dict[str, Any]] = None
+    last_status: CriterionStatus = "pending"
+    last_summary: Optional[str] = None
+    last_checked_turn: Optional[int] = None
+
+
+def _coerce_criteria(
+    raw: Optional[list[Any]],
+) -> list[AcceptanceCriterion]:
+    """Accept the agent-emitted shape, which is still a list of plain strings
+    for back-compat, OR a list of dicts, OR a list of AcceptanceCriterion."""
+    if not raw:
+        return []
+    out: list[AcceptanceCriterion] = []
+    for item in raw:
+        if isinstance(item, AcceptanceCriterion):
+            out.append(item)
+        elif isinstance(item, str):
+            out.append(AcceptanceCriterion(text=item))
+        elif isinstance(item, dict):
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            verifier = item.get("verifier")
+            spec = item.get("spec")
+            out.append(
+                AcceptanceCriterion(
+                    text=text,
+                    verifier=str(verifier) if verifier else None,
+                    spec=dict(spec) if isinstance(spec, dict) else None,
+                    last_status=item.get("last_status", "pending"),
+                    last_summary=item.get("last_summary"),
+                    last_checked_turn=item.get("last_checked_turn"),
+                )
+            )
+    return out
+
+
+@dataclass
 class Task:
     id: str = field(default_factory=lambda: _id("task"))
     title: str = ""
@@ -94,16 +141,23 @@ class Task:
     creator: str = ""
     status: TaskStatus = "pending"
     depends_on: list[str] = field(default_factory=list)  # task IDs
-    acceptance_criteria: list[str] = field(default_factory=list)
+    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
     deliverable_summary: Optional[str] = None
     created_at: float = field(default_factory=now)
     updated_at: float = field(default_factory=now)
+
+    def __post_init__(self) -> None:
+        # Boundary coercion: agent-emitted JSON still uses plain strings.
+        self.acceptance_criteria = _coerce_criteria(self.acceptance_criteria)
 
     def is_unblocked(self, all_tasks: dict[str, "Task"]) -> bool:
         return all(
             all_tasks.get(dep) and all_tasks[dep].status == "complete"
             for dep in self.depends_on
         )
+
+    def criteria_with_verifier(self) -> list[AcceptanceCriterion]:
+        return [c for c in self.acceptance_criteria if c.verifier]
 
 
 @dataclass
@@ -177,6 +231,8 @@ ActionType = Literal[
     "note",
     "ask_user",
     "verify",
+    "check_criterion",
+    "write_doc",
 ]
 
 

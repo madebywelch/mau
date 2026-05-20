@@ -25,6 +25,7 @@ from mau_cli.agent import Agent
 from mau_cli.inference import InferenceBackend
 from mau_cli.message_bus import MessageBus
 from mau_cli.schemas import (
+    AcceptanceCriterion,
     AgentState,
     AgentTurn,
     Message,
@@ -81,6 +82,10 @@ class Orchestrator:
         # The "complete" action handler consults this to avoid marking a
         # rejected agent complete (which would freeze them out of `_ready_agents`).
         self._rejected_this_turn: set[str] = set()
+        # One-shot guards so the same termination event isn't emitted twice
+        # from `_is_done` (which is polled on every loop iteration).
+        self._turn_cap_announced = False
+        self._completion_announced = False
 
         # Per-agent transcript directory. Defaults to <workspace>/logs/ so
         # AHE / Evolution-Agent tooling has prompt+response tapes to chew on.
@@ -379,7 +384,8 @@ class Orchestrator:
 
             self._apply_turn(agent, turn)
             if self._global_turns >= self.max_turns:
-                self._emit("max_turns_reached", {})
+                self._emit("stopped_on_turn_cap", {"turns": self._global_turns})
+                self._emit("max_turns_reached", {})  # back-compat alias
                 self.world.final_summary = "Halted: max_turns reached."
                 return True
 
@@ -590,7 +596,6 @@ class Orchestrator:
             assignee = self.world.agents.get(task.assignee)
             if assignee is not None:
                 assignee.assigned_tasks.append(task.id)
-                # Notify the assignee via inbox.
                 self.bus.deliver(
                     Message(
                         from_agent=agent.state.name,
@@ -600,7 +605,7 @@ class Orchestrator:
                         body=(
                             f"Task {task.id}\n"
                             f"{task.description}\n"
-                            f"Acceptance: {', '.join(task.acceptance_criteria) or '(none)'}\n"
+                            f"Acceptance: {_format_criteria_inline(task.acceptance_criteria)}\n"
                             f"Depends on: {', '.join(task.depends_on) or '(none)'}"
                         ),
                         references=[task.id],
@@ -640,9 +645,6 @@ class Orchestrator:
             files = list(action.get("files_touched", []) or [])
             missing = self._verify_files(files)
             if missing:
-                # Hallucination: agent claimed files that don't exist on disk.
-                # Reject the deliverable, mark the agent for reactivation,
-                # and tell them about the gap so they can correct it.
                 agent.state.notes.append(
                     f"deliverable rejected — claimed files missing on disk: {missing}"
                 )
@@ -666,6 +668,16 @@ class Orchestrator:
                     {"agent": agent.state.name, "claimed": files, "missing": missing},
                 )
                 return
+
+            # Auto-run criteria-attached verifiers for whichever task this
+            # deliverable will close. Failures route through the same channel
+            # as a verify-action failure so the agent gets reactivated.
+            target_task = self._first_open_assigned_task(agent)
+            if target_task is not None:
+                failures = self._check_task_criteria(target_task)
+                if failures:
+                    self._reject_deliverable_for_criteria(agent, target_task, failures)
+                    return
 
             agent.state.deliverables.append(
                 f"{action.get('title', 'deliverable')}: {action.get('summary', '')}"
@@ -756,6 +768,9 @@ class Orchestrator:
         elif action_type == "verify":
             self._dispatch_verify(agent, action)
 
+        elif action_type == "check_criterion":
+            self._dispatch_check_criterion(agent, action)
+
         else:
             self._emit("unknown_action", {"agent": agent.state.name, "type": action_type})
 
@@ -834,6 +849,167 @@ class Orchestrator:
                     "Address the failure and re-run the verifier before claiming done."
                 ),
             )
+        )
+
+    # ---- criterion checking ---------------------------------------------
+
+    def _first_open_assigned_task(self, agent: Agent) -> Optional[Task]:
+        for tid in agent.state.assigned_tasks:
+            task = self.world.tasks.get(tid)
+            if task and task.status != "complete":
+                return task
+        return None
+
+    def _run_criterion(
+        self, criterion: AcceptanceCriterion
+    ) -> Optional[VerifierResult]:
+        """Run a criterion's verifier (if any) and write the outcome back
+        onto the criterion. Returns the result, or None if no verifier."""
+        if not criterion.verifier:
+            return None
+        verifier = VERIFIERS.get(criterion.verifier)
+        if verifier is None:
+            criterion.last_status = "failed"
+            criterion.last_summary = f"unknown verifier {criterion.verifier!r}"
+            criterion.last_checked_turn = self._global_turns
+            return VerifierResult(ok=False, summary=criterion.last_summary)
+        if self.world.workspace is None:
+            return None
+        ws_root = Path(self.world.workspace.code_dir)
+        spec = dict(criterion.spec or {})
+        try:
+            result = verifier.run(spec, ws_root)
+        except Exception as e:
+            result = VerifierResult(
+                ok=False, summary=f"verifier crashed: {e}", details={"error": str(e)}
+            )
+        criterion.last_status = "passed" if result.ok else "failed"
+        criterion.last_summary = result.summary
+        criterion.last_checked_turn = self._global_turns
+        return result
+
+    def _check_task_criteria(
+        self, task: Task
+    ) -> list[tuple[int, AcceptanceCriterion, VerifierResult]]:
+        """Run every criterion-attached verifier for `task`. Returns the
+        failing (index, criterion, result) tuples — empty list means all
+        passed (or there were no verifiers attached)."""
+        failures: list[tuple[int, AcceptanceCriterion, VerifierResult]] = []
+        for idx, criterion in enumerate(task.acceptance_criteria):
+            if not criterion.verifier:
+                continue
+            result = self._run_criterion(criterion)
+            if result is None:
+                continue
+            payload = {
+                "task_id": task.id,
+                "criterion_index": idx,
+                "text": criterion.text,
+                "verifier": criterion.verifier,
+                "ok": result.ok,
+                "summary": result.summary,
+            }
+            if result.ok:
+                self._emit("criterion_passed", payload)
+            else:
+                self._emit(
+                    "criterion_failed",
+                    {**payload, "details": result.details},
+                )
+                failures.append((idx, criterion, result))
+        return failures
+
+    def _reject_deliverable_for_criteria(
+        self,
+        agent: Agent,
+        task: Task,
+        failures: list[tuple[int, AcceptanceCriterion, VerifierResult]],
+    ) -> None:
+        self._rejected_this_turn.add(agent.state.name)
+        summary_lines = [
+            f"  - [{idx}] {c.text}: {r.summary}" for idx, c, r in failures
+        ]
+        agent.state.notes.append(
+            f"deliverable rejected — {len(failures)} criterion(s) failed for {task.id}"
+        )
+        self.bus.deliver(
+            Message(
+                from_agent="orchestrator",
+                to_agent=agent.state.name,
+                msg_type="blocker",
+                subject=f"Deliverable rejected — {len(failures)} acceptance criteria failed",
+                body=(
+                    f"Task {task.id} ({task.title}) cannot complete: "
+                    f"the following acceptance criteria have verifiers that failed.\n"
+                    + "\n".join(summary_lines)
+                    + "\n\nFix the work and emit a fresh DELIVERABLE."
+                ),
+                references=[task.id],
+            )
+        )
+        self._emit(
+            "deliverable_rejected",
+            {
+                "agent": agent.state.name,
+                "task_id": task.id,
+                "criterion_failures": [
+                    {"index": idx, "text": c.text, "summary": r.summary}
+                    for idx, c, r in failures
+                ],
+            },
+        )
+
+    def _dispatch_check_criterion(
+        self, agent: Agent, action: dict[str, Any]
+    ) -> None:
+        task_id = str(action.get("task_id", "")).strip()
+        task = self.world.tasks.get(task_id)
+        if task is None:
+            self._emit(
+                "check_criterion_invalid",
+                {"agent": agent.state.name, "reason": "unknown task_id", "task_id": task_id},
+            )
+            return
+        try:
+            idx = int(action.get("criterion_index"))
+        except (TypeError, ValueError):
+            self._emit(
+                "check_criterion_invalid",
+                {"agent": agent.state.name, "reason": "criterion_index must be int"},
+            )
+            return
+        if idx < 0 or idx >= len(task.acceptance_criteria):
+            self._emit(
+                "check_criterion_invalid",
+                {"agent": agent.state.name, "reason": "index out of range"},
+            )
+            return
+        criterion = task.acceptance_criteria[idx]
+        if not criterion.verifier:
+            self._emit(
+                "check_criterion_skipped",
+                {
+                    "agent": agent.state.name,
+                    "task_id": task_id,
+                    "criterion_index": idx,
+                    "reason": "no verifier attached",
+                },
+            )
+            return
+        result = self._run_criterion(criterion)
+        if result is None:
+            return
+        payload = {
+            "agent": agent.state.name,
+            "task_id": task_id,
+            "criterion_index": idx,
+            "verifier": criterion.verifier,
+            "ok": result.ok,
+            "summary": result.summary,
+        }
+        self._emit(
+            "criterion_passed" if result.ok else "criterion_failed",
+            payload if result.ok else {**payload, "details": result.details},
         )
 
     # ---- helpers ----------------------------------------------------------
@@ -946,15 +1122,62 @@ class Orchestrator:
         if self.world.finished:
             return True
         if self._global_turns >= self.max_turns:
+            if not self._turn_cap_announced:
+                self._emit("stopped_on_turn_cap", {"turns": self._global_turns})
+                self._turn_cap_announced = True
             return True
         if not self.agents:
             return False
-        # Done when all agents are complete and no tasks remain in flight.
+        # Organizational completion: all agents complete and no open tasks.
         all_complete = all(a.state.status == "complete" for a in self.agents.values())
         no_open_tasks = all(
             t.status in ("complete", "cancelled") for t in self.world.tasks.values()
         )
-        return all_complete and no_open_tasks
+        if not (all_complete and no_open_tasks):
+            return False
+
+        # Objective stop predicate. If any task has criteria with a verifier
+        # attached, require all such criteria to have passed. If NO criterion
+        # across all tasks has a verifier (legacy/narrative-only runs), fall
+        # back to organizational completion alone — matches pre-Task-3 behaviour.
+        any_verifier = False
+        unmet: list[tuple[str, int, str, str]] = []
+        for task in self.world.tasks.values():
+            for idx, c in enumerate(task.acceptance_criteria):
+                if not c.verifier:
+                    continue
+                any_verifier = True
+                if c.last_status != "passed":
+                    unmet.append((task.id, idx, c.text, c.last_status))
+        if not any_verifier:
+            self._announce_completion(objective=False)
+            return True
+        if unmet:
+            self._emit(
+                "completion_blocked_by_criteria",
+                {
+                    "unmet": [
+                        {"task_id": t, "index": i, "text": txt, "status": st}
+                        for t, i, txt, st in unmet
+                    ]
+                },
+            )
+            return False
+        self._announce_completion(objective=True)
+        return True
+
+    def _announce_completion(self, *, objective: bool) -> None:
+        if self._completion_announced:
+            return
+        self._completion_announced = True
+        self._emit(
+            "stopped_on_completion",
+            {
+                "objective": objective,
+                "turns": self._global_turns,
+                "tasks": len(self.world.tasks),
+            },
+        )
 
     def _build_final_summary(self) -> str:
         lines = [
@@ -982,6 +1205,18 @@ class Orchestrator:
 
 
 # ---- module-level snapshot helpers ----------------------------------------
+
+
+def _format_criteria_inline(criteria: list[AcceptanceCriterion]) -> str:
+    if not criteria:
+        return "(none)"
+    parts: list[str] = []
+    for c in criteria:
+        if c.verifier:
+            parts.append(f"{c.text} [verifier={c.verifier}]")
+        else:
+            parts.append(c.text)
+    return "; ".join(parts)
 
 
 def _message_from_dict(d: dict[str, Any]) -> Message:

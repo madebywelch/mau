@@ -38,9 +38,21 @@ types listed here are valid; unknown types are ignored.
     "description": "<longer>",
     "assignee": "<agent name>",
     "depends_on": ["task_xxx"],              // tasks that must complete first
-    "acceptance_criteria": ["..."]
+    "acceptance_criteria": [
+      "plain string criterion",              // narrative; humans/agents read it
+      { "text": "POST /items 201s",          // structured, machine-checkable
+        "verifier": "run_command",
+        "spec": { "command": "pytest -q tests/test_items.py" } }
+    ]
   }
   ```
+  Each criterion can be a plain string (narrative only) OR a structured
+  object with an optional `verifier` (a name from `verify`'s registry) and
+  `spec`. When the assignee emits a `deliverable` for this task, the
+  orchestrator runs every criterion with a verifier; failures reject the
+  deliverable via a `blocker` exactly like a failed `verify` action.
+  Verifier-bearing criteria also gate the run's overall stop condition —
+  the orchestrator will not declare completion until they all pass.
 - `spawn_agent` — only EM / Tech Lead / Product. Adds a new teammate.
   ```
   { "type": "spawn_agent",
@@ -109,6 +121,13 @@ types listed here are valid; unknown types are ignored.
     "verifier": "run_command",
     "spec": { "command": "pytest -q", "timeout_seconds": 60 } }
   ```
+- `check_criterion` — re-run one acceptance criterion's verifier on demand.
+  Useful when you want to spot-check a single criterion mid-task or confirm
+  a fix landed without re-running the whole task's deliverable.
+  ```
+  { "type": "check_criterion", "task_id": "task_xxx", "criterion_index": 0 }
+  ```
+  Criteria without a `verifier` are skipped silently.
   Specialists can also attach verifiers to their final DELIVERABLE block
   by adding a `verify` array; each entry runs BEFORE the deliverable is
   recorded so a failure rejects the deliverable too:
@@ -159,3 +178,19 @@ When your work depends on a teammate's output:
   over re-sending the same message.
 - Prefer asking peers over escalating up. Escalate only on genuine blockers.
 - When you have an inbox, address it before originating new work.
+
+## RUN COMPLETION
+
+The orchestrator emits one of two termination events at the end of a run:
+
+- `stopped_on_completion` — all agents are `complete`, all tasks are
+  `complete`/`cancelled`, and every acceptance criterion with a verifier
+  attached has `last_status == "passed"`. If no task carried a verifier-
+  bearing criterion, the run still ends here once the team is idle —
+  narrative-only criteria don't gate the stop condition.
+- `stopped_on_turn_cap` — the global turn budget was reached before
+  completion. Treat this as a hard failure: the team didn't finish.
+
+Specialists: when you attach a verifier to a criterion (via the planner's
+`create_task`) or in your `deliverable`'s `verify` array, you are signing
+up for an objective gate. Don't claim done with a known-broken verifier.
