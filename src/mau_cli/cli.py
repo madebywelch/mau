@@ -1,9 +1,10 @@
 """CLI entry point — `mau` command.
 
-Two modes:
-  mau "build a user dashboard"     # one-shot, runs to completion
-  mau                              # interactive: prompt for the request,
-                                   # then render the live TUI
+Three surfaces:
+  mau "build a user dashboard"          # one-shot, runs to completion
+  mau                                   # interactive: prompts for the request,
+                                        # then renders the live TUI
+  mau evolve {summarize,propose,regress}  # AHE prototype — see evolution.py
 """
 
 from __future__ import annotations
@@ -21,6 +22,13 @@ from rich.prompt import Prompt
 from rich.text import Text
 
 from mau_cli import __version__
+from mau_cli.evolution import (
+    EvolutionAgent,
+    RegressionSuite,
+    format_proposals,
+    format_regression,
+    format_summary_table,
+)
 from mau_cli.inference import select_backend
 from mau_cli.orchestrator import (
     DEFAULT_CONCURRENCY,
@@ -47,9 +55,49 @@ SPLASH = r"""
 """
 
 
-@click.command(
+# Subcommands users may invoke directly. Anything else passed at the group
+# level (positional or unknown option) is treated as args for `run`, so the
+# original `mau "build a thing"` / `mau --backend mock "..."` invocations
+# keep working after Task 7 turned `mau` into a subcommand group.
+_KNOWN_SUBCOMMANDS = {"run", "evolve"}
+_GROUP_ONLY_FLAGS = {"--help", "-h", "--version"}
+
+
+class _MauGroup(click.Group):
+    """Group that forwards bare requests / unknown flags to `run`.
+
+    Click would otherwise reject `mau --backend mock "..."` because
+    `--backend` isn't a group option. We rewrite the argv so anything that
+    isn't a known subcommand or a recognised group flag gets prepended with
+    `run`, restoring the pre-Task-7 ergonomics.
+    """
+
+    def parse_args(self, ctx, args):  # type: ignore[override]
+        if args:
+            first = args[0]
+            if first not in _KNOWN_SUBCOMMANDS and first not in _GROUP_ONLY_FLAGS:
+                args = ["run", *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group(
     name="mau",
+    cls=_MauGroup,
+    invoke_without_command=True,
     help="MAU-CLI — orchestrate a simulated engineering team via local Claude / Codex.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+@click.version_option(version=__version__, prog_name="mau")
+@click.pass_context
+def main(ctx: click.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        # Bare `mau` with no positional / subcommand → interactive prompt.
+        ctx.invoke(run)
+
+
+@main.command(
+    name="run",
+    help="Run a single orchestration session (the default behaviour).",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 @click.argument("request", required=False, nargs=-1)
@@ -125,8 +173,7 @@ SPLASH = r"""
     "workspace is a git repo, else shared. 'shared' forces the legacy "
     "single-cwd mode. 'worktree' fails if the workspace isn't a git repo.",
 )
-@click.version_option(version=__version__, prog_name="mau")
-def main(
+def run(
     request: tuple[str, ...],
     backend: str,
     max_turns: int,
@@ -416,6 +463,146 @@ def _resolve_resume_path(arg: str, console: Console) -> Optional[tuple[str, dict
         return None
 
     return str(ws_root), snapshot
+
+
+# ---- evolve subcommand group ------------------------------------------------
+#
+# Surfaces the Evolution Agent prototype. Each subcommand is read-only against
+# the prompts dir; even `regress` patches a temp copy. Mutations stay gated
+# behind a human review of the printed proposals.
+
+
+def _default_prompts_dir() -> Path:
+    """Resolve the packaged prompts dir. Falls back to the source layout when
+    running from a checkout without an install."""
+    try:
+        return Path(str(__import__("mau_cli.prompts", fromlist=["__file__"]).__file__)).parent
+    except Exception:
+        return Path(__file__).parent / "prompts"
+
+
+def _resolve_logs_dir(explicit: Optional[str]) -> Optional[Path]:
+    """Pick a logs dir to ingest. Honours `--logs-dir` first; otherwise looks
+    for the most recent `./.mau/runs/<ts>/logs/`."""
+    if explicit:
+        return Path(explicit).resolve()
+    runs_dir = Path.cwd() / ".mau" / "runs"
+    if not runs_dir.exists():
+        return None
+    candidates = sorted(
+        (p for p in runs_dir.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for c in candidates:
+        logs = c / "logs"
+        if logs.exists():
+            return logs
+    return None
+
+
+@main.group(
+    name="evolve",
+    help="Agentic Harness Engineering prototype — ingest transcripts and "
+    "propose harness mutations gated by a regression suite.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+def evolve() -> None:
+    pass
+
+
+@evolve.command(
+    name="summarize",
+    help="Print per-agent transcript stats: turns, accept/reject rates, "
+    "tokens, avg duration, and top rejection reasons.",
+)
+@click.option(
+    "--logs-dir",
+    "logs_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory of `<agent>.jsonl` transcripts. Defaults to the most "
+    "recent ./.mau/runs/<ts>/logs/.",
+)
+def evolve_summarize(logs_dir: Optional[str]) -> None:
+    console = Console()
+    resolved = _resolve_logs_dir(logs_dir)
+    if resolved is None:
+        console.print("[yellow]No logs directory found.[/yellow]")
+        return
+    agent = EvolutionAgent(
+        logs_dir=resolved, prompts_dir=_default_prompts_dir()
+    )
+    summaries = agent.summarize()
+    console.print(Panel(Text(format_summary_table(summaries)),
+                        title=f"transcripts @ {resolved}", border_style="cyan"))
+
+
+@evolve.command(
+    name="propose",
+    help="Emit HarnessProposals based on transcript signals. Read-only — "
+    "proposals print to stdout; the prompts dir is never mutated.",
+)
+@click.option(
+    "--logs-dir",
+    "logs_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory of `<agent>.jsonl` transcripts.",
+)
+@click.option(
+    "--use-backend",
+    is_flag=True,
+    help="Also ask the configured backend to draft concrete prompt diffs for "
+    "prompt_edit proposals. Skipped when the resolved backend is the mock.",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(["auto", "claude", "codex", "mock"], case_sensitive=False),
+    default="auto",
+    help="Inference backend used when --use-backend is set.",
+)
+def evolve_propose(
+    logs_dir: Optional[str], use_backend: bool, backend: str
+) -> None:
+    console = Console()
+    resolved = _resolve_logs_dir(logs_dir)
+    if resolved is None:
+        console.print("[yellow]No logs directory found.[/yellow]")
+        return
+    backend_obj = select_backend(backend.lower()) if use_backend else None
+    agent = EvolutionAgent(
+        logs_dir=resolved,
+        prompts_dir=_default_prompts_dir(),
+        backend=backend_obj,
+    )
+    proposals = agent.propose()
+    console.print(Panel(Text(format_proposals(proposals)),
+                        title=f"proposals @ {resolved}", border_style="cyan"))
+
+
+@evolve.command(
+    name="regress",
+    help="Run the regression suite against the bundled fixtures using the "
+    "mock backend. Reports per-fixture pass/fail.",
+)
+@click.option(
+    "--fixtures",
+    "fixtures_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory of fixture JSON files. Defaults to the packaged "
+    "src/mau_cli/evolution_fixtures/.",
+)
+def evolve_regress(fixtures_dir: Optional[str]) -> None:
+    console = Console()
+    suite = RegressionSuite(
+        fixtures_dir=Path(fixtures_dir).resolve() if fixtures_dir else None
+    )
+    verdicts = suite.run()
+    console.print(Panel(Text(format_regression(verdicts)),
+                        title="regression results",
+                        border_style="green" if all(v.passed for v in verdicts) else "yellow"))
 
 
 if __name__ == "__main__":

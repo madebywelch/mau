@@ -178,19 +178,70 @@ specialist headcount and turn budget.
 | `--max-budget USD` | Hard-cap total spend; halts the run when reached. |
 | `--no-tui` | Skip the live TUI; print events as plain text. |
 | `--save PATH` | Also persist a copy of `session.json` to this path. |
+| `--policy RULE` | Repeatable. Seed a durable policy. See `--policy 'role:<role>=<rule>'`. |
+| `--isolation {auto,shared,worktree}` | Per-agent isolation backend. `auto` picks worktree in a git repo. |
 | `--version` | Show version and exit. |
 | `-h, --help` | Show help and exit. |
 
+Subcommands: `mau run [...]` (default), `mau evolve {summarize,propose,regress}`.
+
 </details>
+
+## Evolution Agent (prototype)
+
+A first cut at **Agentic Harness Engineering** — a separate agent that
+ingests the per-agent `logs/<agent>.jsonl` transcripts and proposes
+mutations to the harness itself (prompt edits, durable policies, default
+changes). The prototype is read-only: it prints `HarnessProposal`s with
+citations to specific transcript lines, but never edits the prompts dir.
+Mutations get applied by a human after review.
+
+```bash
+# Per-agent stats (turns, accept/reject, tokens, avg duration, top reasons)
+mau evolve summarize --logs-dir .mau/runs/<ts>/logs
+
+# Print proposals based on deterministic transcript signals
+mau evolve propose --logs-dir .mau/runs/<ts>/logs
+
+# Same, but also ask the configured backend to draft concrete prompt diffs
+mau evolve propose --use-backend --backend claude --logs-dir .mau/runs/<ts>/logs
+
+# Regression suite — run the mock backend against bundled fixtures and
+# report pass/fail. Used to gate any proposed harness mutation before it
+# touches the source tree.
+mau evolve regress
+```
+
+Deterministic signals the prototype fires on today:
+
+| Signal | Kind | Target |
+|---|---|---|
+| Role's rejection rate > 40% over ≥ 5 turns | `prompt_edit` | `prompts/<role>.md` |
+| Same file written by multiple same-role agents under `worktree` isolation | `policy_suggestion` | `policy:role:<role>` |
+| Role's avg duration > 2x the cross-role median | `default_change` | `default:MAX_TURNS_PER_AGENT` |
+
+Every proposal carries an evidence list of `logs/<agent>.jsonl:turn=<N>`
+citations so you can pop open the transcript and see the exact lines
+the signal fired on.
+
+**Regression gate.** Before any of these get merged, the bundled
+`RegressionSuite` runs each fixture in `src/mau_cli/evolution_fixtures/`
+against the deterministic `MockBackend` and verifies the run still
+reaches `stopped_on_completion` without hitting `stopped_on_turn_cap`.
+The gate is the philosophy: a harness mutation that breaks the
+fixture's convergence is rejected before a human ever reviews it. The
+prototype's `apply_proposal` copies the prompts dir to a temp location
+and stages the proposed diff there — your source tree is never mutated.
 
 ## Roadmap
 
 - **Specialist messaging.** Allow specialists to send messages mid-task
   (currently they only deliver or block).
-- **Per-agent transcripts.** Write each agent's prompt+response stream
-  to `logs/<agent>.jsonl`.
 - **Pluggable backends.** OpenAI, Anthropic API direct, Ollama for
   local models.
+- **Hot-swappable prompts** in the Evolution Agent's regression run, so
+  proposed prompt diffs actually drive the mock-backend fixtures rather
+  than the prototype's "patch staged" record.
 - **Single-binary distribution.** Rewrite in Go with bubbletea TUI.
 
 ## Contributing
