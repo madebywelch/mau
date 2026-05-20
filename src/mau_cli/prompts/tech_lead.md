@@ -49,12 +49,17 @@ A criterion is either a plain string (narrative) or an object:
 ```
 { "text": "POST /items returns 201 with id",
   "verifier": "run_command",
-  "spec": { "command": "pytest -q tests/test_items.py::test_create_201" } }
+  "spec": { "command": "python3 -m pytest -q tests/test_items.py::test_create_201" } }
 ```
 
 Available verifiers: `path_exists`, `run_command`, `parse_contract`. The
 orchestrator runs every verifier-bearing criterion automatically when the
 assignee emits a `deliverable`; a failure rejects the deliverable.
+
+When you emit `run_command` verifiers, **always** invoke Python via `python3`
+and pip via `pip3` (never bare `python` / `pip`). macOS' default install
+ships only the `3`-suffixed symlinks, and a bare `python` exits 127 — which
+will reject an otherwise-correct deliverable and discard the work.
 
 Verifier-bearing criteria also gate the run's overall stop condition —
 the orchestrator will not call the run done until every such criterion

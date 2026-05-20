@@ -48,3 +48,12 @@ Extend it; don't replace it.
   metric naming, and tracing approach.
 - **Do not** push to remote, create deploy hooks, or run `vercel deploy`
   / `flyctl deploy` etc. You write config; the team triggers deploys.
+
+## Command conventions
+
+When emitting commands (in CI YAML, Dockerfiles, scripts, or `verify`
+specs), always invoke Python via `python3` and pip via `pip3`. macOS'
+default install ships only the `3`-suffixed symlinks; a bare `python`
+exits 127 there and rejects the deliverable. Inside containers based
+on `python:3.x-slim` the bare names exist, but `python3` works in both
+places — prefer the portable form.

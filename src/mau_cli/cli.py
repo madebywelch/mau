@@ -143,7 +143,12 @@ def main(ctx: click.Context) -> None:
     "max_budget_usd",
     type=float,
     default=None,
-    help="Hard cap on total spend in USD. Halts the run when reached.",
+    help=(
+        "Hard cap on total spend in USD. The orchestrator refuses to "
+        "dispatch any new agent turn once spend reaches this value, but "
+        "in-flight turns from the prior tick still complete, so the final "
+        "total may overshoot slightly."
+    ),
 )
 @click.option(
     "--no-tui",

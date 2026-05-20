@@ -18,7 +18,7 @@ import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -100,6 +100,32 @@ class RunCommandVerifier(Verifier):
         timeout = float(spec.get("timeout_seconds", 60))
         expected_exit = int(spec.get("expected_exit", 0))
 
+        result = self._run_once(command, cwd, timeout, expected_exit)
+
+        # Macos default Pythons ship without a `python` symlink (only
+        # `python3`); same story for `pip` vs `pip3` and the standard Homebrew
+        # layout. Agents are instructed to use the `3` suffix but occasionally
+        # forget, and rejecting a valid deliverable over a missing symlink
+        # discards real work. On exit 127 (command not found) with `python`
+        # or `pip` as the leading token, retry once with the suffixed form.
+        if (
+            not result.ok
+            and result.details.get("exit") == 127
+            and isinstance(command, str)
+        ):
+            substituted = _substitute_python3(command)
+            if substituted is not None:
+                retry = self._run_once(substituted, cwd, timeout, expected_exit)
+                retry.details["substituted_from"] = command
+                retry.details["substituted_to"] = substituted
+                retry.details["substituted_python3"] = True
+                return retry
+
+        return result
+
+    def _run_once(
+        self, command: str, cwd: str, timeout: float, expected_exit: int
+    ) -> VerifierResult:
         try:
             proc = subprocess.run(
                 command,
@@ -143,6 +169,26 @@ class RunCommandVerifier(Verifier):
                 "stderr_tail": proc.stderr[-800:],
             },
         )
+
+
+def _substitute_python3(command: str) -> Optional[str]:
+    """Return `command` with a leading `python` or `pip` swapped for `python3`
+    or `pip3`. Returns None if the first whitespace-separated token isn't one
+    of those (so we never silently rewrite anything else)."""
+    stripped = command.lstrip()
+    if not stripped:
+        return None
+    parts = stripped.split(maxsplit=1)
+    head = parts[0]
+    if head == "python":
+        new_head = "python3"
+    elif head == "pip":
+        new_head = "pip3"
+    else:
+        return None
+    leading_ws = command[: len(command) - len(stripped)]
+    tail = "" if len(parts) == 1 else " " + parts[1]
+    return f"{leading_ws}{new_head}{tail}"
 
 
 class ParseContractVerifier(Verifier):

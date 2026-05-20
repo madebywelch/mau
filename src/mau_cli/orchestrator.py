@@ -1120,6 +1120,17 @@ class Orchestrator:
                 details={"error": str(e)},
             )
 
+        if result.details.get("substituted_python3"):
+            self._emit(
+                "verifier_substituted_python3",
+                {
+                    "agent": agent.state.name,
+                    "verifier": verifier_name,
+                    "from": result.details.get("substituted_from"),
+                    "to": result.details.get("substituted_to"),
+                },
+            )
+
         payload = {
             "agent": agent.state.name,
             "verifier": verifier_name,
@@ -1251,6 +1262,16 @@ class Orchestrator:
         except Exception as e:
             result = VerifierResult(
                 ok=False, summary=f"verifier crashed: {e}", details={"error": str(e)}
+            )
+        if result.details.get("substituted_python3"):
+            self._emit(
+                "verifier_substituted_python3",
+                {
+                    "criterion": criterion.text,
+                    "verifier": criterion.verifier,
+                    "from": result.details.get("substituted_from"),
+                    "to": result.details.get("substituted_to"),
+                },
             )
         criterion.last_status = "passed" if result.ok else "failed"
         criterion.last_summary = result.summary

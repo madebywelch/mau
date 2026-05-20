@@ -123,6 +123,9 @@ types listed here are valid; unknown types are ignored.
   - `run_command` — `spec: {"command": "pytest -q", "cwd": "subdir",
     "timeout_seconds": 60, "expected_exit": 0}`. Runs via shell; non-zero
     exit (or a timeout) fails. `cwd` is workspace-relative.
+    **Always use `python3` and `pip3`** (never bare `python` / `pip`) so
+    commands run on macOS, where the default Python install lacks a
+    `python` symlink and bare `python` exits 127.
   - `parse_contract` — `spec: {"path": "src/foo.py"}`. Parses one file
     based on extension: `.py` via `ast.parse`, `.json` via `json.loads`,
     `.yaml/.yml` via PyYAML if installed (skipped otherwise), `.ts/.tsx/

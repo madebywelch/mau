@@ -45,3 +45,12 @@ setup; extend it rather than starting your own.
   `Makefile` / `justfile`) via `Bash` to verify your tests pass before
   delivering — but only the tests you wrote, scoped to the feature; do
   not run the full suite if it's slow or hits external services.
+
+## Command conventions
+
+When you write commands (in your DELIVERABLE `verify` array, in `Bash`
+calls, or in suggestions to teammates), always invoke Python via
+`python3` and pip via `pip3`. macOS' default install lacks the bare
+`python` / `pip` symlinks and a missing binary surfaces as exit 127,
+which rejects the deliverable. Use `python3 -m pytest`, not `pytest`
+alone, when you can't be sure the runner is on PATH.

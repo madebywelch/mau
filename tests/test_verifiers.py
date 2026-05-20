@@ -69,6 +69,41 @@ def test_run_command_timeout(tmp_path):
     assert "timed out" in res.summary.lower()
 
 
+def test_run_command_retries_python3_on_127(tmp_path, monkeypatch):
+    """Exit 127 with `python` as the first token retries once with `python3`.
+
+    Deterministic via PATH manipulation: we point PATH at a directory
+    containing only a `python3` shim and verify both that the bare `python`
+    command fails (127) and that the verifier transparently retries.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Minimal `python3` shim that prints "3" and exits 0 — enough to verify
+    # the substituted command succeeds.
+    py3 = bin_dir / "python3"
+    py3.write_text("#!/bin/sh\necho 3\nexit 0\n")
+    py3.chmod(0o755)
+    # Pin PATH so `python` is genuinely missing and `python3` is found.
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    res = RunCommandVerifier().run({"command": "python --version"}, tmp_path)
+    assert res.ok is True, f"retry should have promoted to python3; got {res}"
+    assert res.details.get("substituted_python3") is True
+    assert res.details.get("substituted_from") == "python --version"
+    assert res.details.get("substituted_to") == "python3 --version"
+
+
+def test_run_command_does_not_substitute_non_python(tmp_path):
+    """Only `python`/`pip` get retried — other 127s must not be rewritten."""
+    res = RunCommandVerifier().run(
+        {"command": "definitely-nonexistent-binary-xyzzy"}, tmp_path
+    )
+    assert res.ok is False
+    # Must NOT have attempted any substitution.
+    assert "substituted_python3" not in res.details
+    assert "substituted_to" not in res.details
+
+
 # ---- parse_contract ---------------------------------------------------------
 
 
