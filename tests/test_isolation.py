@@ -147,3 +147,50 @@ def test_brownfield_dirty_repo_falls_back_to_shared(tmp_git_workspace):
     )
     assert isinstance(backend, SharedWorkspaceBackend)
     assert any(k == "worktree_disabled" for k, _ in events)
+
+
+# ---- greenfield merge destination ------------------------------------------
+
+
+def test_worktree_merges_into_merge_dest_not_git_root(tmp_path):
+    """Greenfield: git init at root, but code_dir is root/workspace/.
+    Files merged from a worktree must land in code_dir, not the git root."""
+    root = tmp_path / "ws"
+    code = root / "workspace"
+    code.mkdir(parents=True)
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "commit", "--allow-empty", "-qm", "init")
+
+    backend = GitWorktreeBackend(git_root=root, merge_dest=code)
+    try:
+        cwd = backend.acquire("agent-x")
+        (cwd / "produced.py").write_text("x = 1\n")
+        backend.release("agent-x", merge=True)
+
+        assert (code / "produced.py").exists(), "must land in code_dir"
+        assert not (root / "produced.py").exists(), "must NOT land in git root"
+    finally:
+        backend.cleanup()
+
+
+def test_make_isolation_backend_greenfield_passes_merge_dest(tmp_path):
+    """End-to-end equivalent of the manual ctor test: `make_isolation_backend`
+    against a nested code_dir must wire merge_dest=code_dir so files don't
+    spill into the git root."""
+    root = tmp_path / "ws"
+    code = root / "workspace"
+    code.mkdir(parents=True)
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "commit", "--allow-empty", "-qm", "init")
+
+    backend = make_isolation_backend(code, mode="worktree")
+    assert isinstance(backend, GitWorktreeBackend)
+    try:
+        cwd = backend.acquire("agent-y")
+        (cwd / "via_factory.py").write_text("y = 2\n")
+        backend.release("agent-y", merge=True)
+
+        assert (code / "via_factory.py").exists()
+        assert not (root / "via_factory.py").exists()
+    finally:
+        backend.cleanup()

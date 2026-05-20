@@ -155,12 +155,23 @@ class GitWorktreeBackend:
 
     def __init__(
         self,
-        repo_root: Path,
+        git_root: Path,
+        merge_dest: Optional[Path] = None,
         worktrees_dir: Optional[Path] = None,
         emit: Optional[EventEmitter] = None,
         keep_worktrees: bool = False,
     ):
-        self.repo_root = repo_root.resolve()
+        # git_root: where .git lives — used for `git worktree add` and as the
+        # default home for `.mau-worktrees/`.
+        # merge_dest: where overlay-copied files land. In greenfield runs
+        # `code_dir` is nested under the git toplevel (e.g. root/workspace/),
+        # so merging back into git_root would orphan files outside the
+        # workspace the orchestrator advertises. Defaults to git_root so
+        # brownfield behaviour (repo root == code dir) is unchanged.
+        self.repo_root = git_root.resolve()
+        self.merge_dest = (
+            merge_dest.resolve() if merge_dest is not None else self.repo_root
+        )
         self.worktrees_dir = (
             worktrees_dir.resolve()
             if worktrees_dir is not None
@@ -202,7 +213,7 @@ class GitWorktreeBackend:
                 f"{proc.stderr.strip() or proc.stdout.strip()}"
             )
         self._worktrees[agent_name] = target
-        self._baselines[agent_name] = _newest_mtime(self.repo_root)
+        self._baselines[agent_name] = _newest_mtime(self.merge_dest)
         self.emit("worktree_created", {"agent": agent_name, "path": str(target)})
         return target
 
@@ -218,7 +229,7 @@ class GitWorktreeBackend:
             baseline = self._baselines.get(agent_name, 0.0)
             for rel in changed:
                 src = worktree / rel
-                dst = self.repo_root / rel
+                dst = self.merge_dest / rel
                 if not src.exists():
                     # Deletion — skip for now. Mau agents overwhelmingly
                     # add/edit; deletion semantics are intentionally out of
@@ -242,7 +253,7 @@ class GitWorktreeBackend:
                     {"agent": agent_name, "files": overwrote},
                 )
             self._reset_worktree(worktree)
-            self._baselines[agent_name] = _newest_mtime(self.repo_root)
+            self._baselines[agent_name] = _newest_mtime(self.merge_dest)
             self.emit(
                 "worktree_merged",
                 {"agent": agent_name, "count": len(merged),
@@ -252,7 +263,7 @@ class GitWorktreeBackend:
 
         # discard
         self._reset_worktree(worktree)
-        self._baselines[agent_name] = _newest_mtime(self.repo_root)
+        self._baselines[agent_name] = _newest_mtime(self.merge_dest)
         self.emit("worktree_discarded", {"agent": agent_name})
         return None
 
@@ -410,8 +421,13 @@ def make_isolation_backend(
         )
         return SharedWorkspaceBackend(code_dir)
 
+    # Greenfield: `git init` may live at the parent of `code_dir` (the user
+    # initialised the run root, with `workspace/` nested under it). The worktree
+    # backend has to run `git worktree add` against the toplevel but merge
+    # back into `code_dir` so files land where every other component expects.
     return GitWorktreeBackend(
-        repo_root=toplevel,
+        git_root=toplevel,
+        merge_dest=code_dir,
         emit=emit,
         keep_worktrees=brownfield,
     )
