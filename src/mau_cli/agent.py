@@ -38,6 +38,10 @@ class Agent:
         self.backend = backend
         self.system_prompt = load_role_prompt(state.role)
         self.is_code_gen = state.role in CODE_GEN_ROLES
+        # Transient, set by run_turn so the orchestrator can persist the
+        # prompt+response pair without changing AgentTurn's shape.
+        self.last_prompt: str = ""
+        self.last_result: InferenceResult | None = None
 
     # ---- prompt construction --------------------------------------------
 
@@ -168,6 +172,9 @@ class Agent:
             result = self.backend.call_plan(self.system_prompt, prompt)
             self.state.usage.add(result.usage)
             world.usage.add(result.usage)
+
+        self.last_prompt = prompt
+        self.last_result = result
 
         turn = self._result_to_turn(result)
         # Track files touched on the agent.

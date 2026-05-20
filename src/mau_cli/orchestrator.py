@@ -58,6 +58,7 @@ class Orchestrator:
         workspace: Optional[Workspace] = None,
         max_budget_usd: Optional[float] = None,
         on_event: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        logs_dir: Optional[Path] = None,
     ):
         self.backend = backend
         self.max_turns = max_turns
@@ -79,6 +80,18 @@ class Orchestrator:
         # The "complete" action handler consults this to avoid marking a
         # rejected agent complete (which would freeze them out of `_ready_agents`).
         self._rejected_this_turn: set[str] = set()
+
+        # Per-agent transcript directory. Defaults to <workspace>/logs/ so
+        # AHE / Evolution-Agent tooling has prompt+response tapes to chew on.
+        # Explicit None (and no workspace) disables logging.
+        if logs_dir is not None:
+            self.logs_dir: Optional[Path] = Path(logs_dir)
+        elif workspace is not None:
+            self.logs_dir = Path(workspace.logs_dir)
+        else:
+            self.logs_dir = None
+        if self.logs_dir is not None:
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- public API -------------------------------------------------------
 
@@ -480,11 +493,52 @@ class Orchestrator:
                     )
                     agent.state.notes.append(f"action error: {e}")
 
+            rejected = agent.state.name in self._rejected_this_turn
+            self._log_transcript(agent, turn, accepted=not rejected)
+
             # If a deliverable was rejected this turn, force the agent back
             # into `working` regardless of any later actions or turn-level status.
-            if agent.state.name in self._rejected_this_turn:
+            if rejected:
                 agent.state.status = "working"
                 self._rejected_this_turn.discard(agent.state.name)
+
+    def _log_transcript(self, agent: Agent, turn: AgentTurn, *, accepted: bool) -> None:
+        """Append one JSONL line per agent turn to logs/<agent>.jsonl.
+
+        Foundational for AHE: without prompt+response tapes per agent, runs
+        can't be debugged, replayed, or regression-tested. Best-effort —
+        a transcript write failure must never abort a turn."""
+        if self.logs_dir is None or agent.last_result is None:
+            return
+        result = agent.last_result
+        files_touched = [
+            a.get("files_touched", []) for a in turn.actions if a.get("type") == "deliverable"
+        ]
+        flat_files = sorted({f for sub in files_touched for f in (sub or [])})
+        record = {
+            "turn": agent.state.turns_taken,
+            "agent": agent.state.name,
+            "role": agent.state.role.value,
+            "timestamp": now(),
+            "prompt": agent.last_prompt,
+            "response": result.raw_text,
+            "tokens": {
+                "input": result.usage.input_tokens,
+                "output": result.usage.output_tokens,
+                "cost_usd": result.usage.cost_usd,
+            },
+            "files_touched": flat_files or list(result.files_touched),
+            "accepted": accepted,
+            "status": turn.status,
+            "backend": result.backend,
+            "duration_ms": result.duration_ms,
+        }
+        try:
+            path = self.logs_dir / f"{agent.state.name}.jsonl"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except OSError as e:
+            self._emit("transcript_error", {"agent": agent.state.name, "error": str(e)})
 
     # ---- workspace-aware helpers ----------------------------------------
 
