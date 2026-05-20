@@ -242,6 +242,16 @@ class AgentState:
     files_touched: list[str] = field(default_factory=list)  # paths relative to workspace
     turns_taken: int = 0
     blocked_turns: int = 0  # for escalation
+    # Run-tracking for the consecutive-error backoff (Bug 5). Resets to 0
+    # on any successful turn. The orchestrator skips the agent for a few
+    # ticks after each consecutive error and escalates / gives up at
+    # configured thresholds so a flaky agent can't pin the run forever.
+    # `last_error_at_turn` stores the orchestrator's tick counter (NOT
+    # the per-agent turns_taken) so the backoff window ages even when no
+    # agent dispatched (otherwise a sole-failing agent would be skipped
+    # forever).
+    consecutive_errors: int = 0
+    last_error_at_turn: Optional[int] = None
     notes: list[str] = field(default_factory=list)  # internal scratchpad
     usage: TokenUsage = field(default_factory=TokenUsage)
     # Wall-clock when this agent's current turn started (None if idle/complete).

@@ -60,20 +60,57 @@ def _detect_specialization(user_prompt: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _detect_agent_name(user_prompt: str) -> str:
+    """Pull the AGENT_NAME line out of the prompt. agent.build_user_prompt
+    always prefixes it; tests that bypass that scaffolding fall back to ''."""
+    m = re.search(r"AGENT_NAME:\s*([\w\-]+)", user_prompt)
+    return m.group(1).strip() if m else ""
+
+
 class MockBackend(InferenceBackend):
     name = "mock"
 
-    def __init__(self, *, cost_per_call_usd: float = 0.0):
+    def __init__(
+        self,
+        *,
+        cost_per_call_usd: float = 0.0,
+        fail_first_n: Optional[dict[str, int]] = None,
+    ):
         # cost_per_call_usd lets tests simulate non-zero spend without standing
         # up a real backend. Defaults to 0.0 so existing tests are unaffected.
         self.cost_per_call_usd = cost_per_call_usd
+        # fail_first_n: {agent_name: N} → raise a RuntimeError the first N
+        # times that agent's role is invoked through call_plan/call_agentic.
+        # Per-agent counters are tracked off the prompt's "AGENT NAME:" line.
+        # Used by Bug-5 backoff tests to model a transiently flaky agent.
+        self.fail_first_n: dict[str, int] = dict(fail_first_n or {})
+        self._call_counts: dict[str, int] = {}
 
     def available(self) -> bool:
         return True
 
+    def _maybe_fail(self, user_prompt: str) -> None:
+        """If the prompt names an agent slated to fail, raise — emulating a
+        live-backend flake. Increments a per-agent counter so once the
+        configured count is reached, subsequent calls succeed normally."""
+        agent_name = _detect_agent_name(user_prompt)
+        if not agent_name:
+            return
+        budget = self.fail_first_n.get(agent_name, 0)
+        if budget <= 0:
+            return
+        count = self._call_counts.get(agent_name, 0)
+        if count >= budget:
+            return
+        self._call_counts[agent_name] = count + 1
+        raise RuntimeError(
+            f"mock flake for {agent_name} (call {count + 1}/{budget})"
+        )
+
     # ---- plan mode -------------------------------------------------------
 
     def call_plan(self, system_prompt: str, user_prompt: str) -> InferenceResult:
+        self._maybe_fail(user_prompt)
         role = _detect_role(system_prompt)
         if role == "product":
             return _wrap_plan(self._product(), cost_usd=self.cost_per_call_usd)
@@ -96,6 +133,7 @@ class MockBackend(InferenceBackend):
         extra_dirs: Optional[list[str]] = None,
         max_budget_usd: Optional[float] = None,
     ) -> InferenceResult:
+        self._maybe_fail(user_prompt)
         role = _detect_role(system_prompt)
         spec = _detect_specialization(user_prompt)
         ws = Path(workspace_dir)

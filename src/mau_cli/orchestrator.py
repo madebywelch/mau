@@ -59,6 +59,16 @@ DEFAULT_CONCURRENCY = 3
 ESCALATION_AFTER_BLOCKED_TURNS = 3
 MAX_TURNS_PER_AGENT = 12  # safety cap per agent to avoid runaway loops
 
+# Bug 5 — consecutive-error backoff. After an agent_error we skip the agent
+# for `min(consecutive_errors, ERROR_BACKOFF_TICKS)` subsequent ticks so the
+# orchestrator can't burn turns retrying the same flaky agent every loop
+# iteration. At ERROR_ESCALATE_AT we route a blocker to the supervisor; at
+# ERROR_GIVEUP_AT we force-complete the agent so the run keeps moving rather
+# than stalling on one stuck participant.
+ERROR_BACKOFF_TICKS = 3
+ERROR_ESCALATE_AT = 3
+ERROR_GIVEUP_AT = 5
+
 # Re-scan the codebase and re-publish shared/codebase.md every N landed
 # deliverables in brownfield mode. The paper calls out that one-shot scans
 # decay — refreshing this keeps agents from reading a stale map as ground
@@ -97,6 +107,10 @@ class Orchestrator:
         self._executor = ThreadPoolExecutor(max_workers=concurrency)
         self._lock = threading.Lock()
         self._global_turns = 0
+        # Tick counter (not turns!). Increments every _tick() call, even
+        # if no agent dispatched. Used to age error-backoff windows so a
+        # stalled agent eventually gets reconsidered.
+        self._tick_count = 0
         # Per-turn flag: agents whose deliverable was rejected this turn.
         # The "complete" action handler consults this to avoid marking a
         # rejected agent complete (which would freeze them out of `_ready_agents`).
@@ -337,6 +351,12 @@ class Orchestrator:
                 progressed = self._tick()
                 self._persist()
                 if not progressed:
+                    # Agents in error-backoff aren't a stall — they'll be
+                    # eligible again after a few ticks elapse. Skip the
+                    # stall break in that case so the backoff window
+                    # actually plays out.
+                    if self._any_agent_in_error_backoff():
+                        continue
                     if not self._unblock_stalled():
                         self._emit("stall", {})
                         break
@@ -528,6 +548,7 @@ class Orchestrator:
 
     def _tick(self) -> bool:
         """Run one batch of concurrent turns. Returns True if any agent acted."""
+        self._tick_count += 1
         # Pre-flight budget check: refuse to dispatch any new turn if we're
         # already at/over the cap. The post-turn check in _main_loop only
         # fires AFTER a turn lands, by which point a $1+ call can have piled
@@ -574,14 +595,15 @@ class Orchestrator:
             try:
                 turn = future.result()
             except Exception as e:
-                self._emit("agent_error", {"agent": agent.state.name, "error": str(e)})
-                agent.state.status = "blocked"
-                agent.state.notes.append(f"inference error: {e}")
-                # Discard the worktree — turn aborted, nothing to merge.
-                self._release_cwd(agent, merge=False)
+                self._handle_agent_error(agent, str(e))
                 continue
 
             self._apply_turn(agent, turn)
+            # Successful turn — clear the consecutive-error counter so a
+            # later transient flake gets a fresh backoff budget.
+            if agent.state.consecutive_errors:
+                agent.state.consecutive_errors = 0
+                agent.state.last_error_at_turn = None
             if self._global_turns >= self.max_turns:
                 self._emit("stopped_on_turn_cap", {"turns": self._global_turns})
                 self._emit("max_turns_reached", {})  # back-compat alias
@@ -589,6 +611,91 @@ class Orchestrator:
                 return True
 
         return True
+
+    def _handle_agent_error(self, agent: Agent, error: str) -> None:
+        """Apply consecutive-error bookkeeping, escalation, and give-up logic.
+        Called from `_tick` when an agent's inference future raises."""
+        agent.state.consecutive_errors += 1
+        # Stamp the tick (not the global turn count): the backoff predicate
+        # needs to age even when no agent dispatched, which only happens via
+        # the tick counter.
+        agent.state.last_error_at_turn = self._tick_count
+        agent.state.notes.append(f"inference error: {error}")
+        self._emit(
+            "agent_error",
+            {
+                "agent": agent.state.name,
+                "error": error,
+                "consecutive_errors": agent.state.consecutive_errors,
+            },
+        )
+        # Discard the worktree — turn aborted, nothing to merge.
+        self._release_cwd(agent, merge=False)
+
+        if agent.state.consecutive_errors >= ERROR_GIVEUP_AT:
+            # Force-complete so the rest of the team can converge. We
+            # intentionally sacrifice this agent's contribution rather than
+            # let a flaky participant stall the whole run.
+            agent.state.status = "complete"
+            agent.state.notes.append(
+                f"force-completed after {agent.state.consecutive_errors} consecutive errors"
+            )
+            self._emit(
+                "agent_given_up",
+                {
+                    "agent": agent.state.name,
+                    "consecutive_errors": agent.state.consecutive_errors,
+                    "last_error": error,
+                },
+            )
+            return
+
+        if agent.state.consecutive_errors == ERROR_ESCALATE_AT:
+            # Hit the escalation threshold exactly once — route a blocker
+            # to the supervisor via the same channel as a verify-failed
+            # rejection. The agent stays `blocked` so the backoff predicate
+            # still keeps them out of the next few ticks.
+            agent.state.status = "blocked"
+            self._notify_supervisor_of_error(agent, error)
+        else:
+            agent.state.status = "blocked"
+
+    def _notify_supervisor_of_error(self, agent: Agent, error: str) -> None:
+        """Deliver a blocker to the agent's supervisor (or the user if the
+        agent sits at the top of SUPERVISOR_OF)."""
+        supervisor_role = SUPERVISOR_OF.get(agent.state.role)
+        target_name: Optional[str] = None
+        if supervisor_role is not None and supervisor_role != Role.USER:
+            target_name = self._first_agent_of_role(supervisor_role)
+        if target_name is None:
+            target_name = "user"
+        body = (
+            f"Agent {agent.state.name} ({agent.state.role.value}) has failed "
+            f"{agent.state.consecutive_errors} turns in a row. "
+            f"Last error: {error[:600]}\n\n"
+            "The orchestrator is backing off for a few ticks before retrying. "
+            "If this keeps happening the agent will be force-completed and "
+            "their contribution will be lost — reassign, redirect, or "
+            "investigate."
+        )
+        self.bus.deliver(
+            Message(
+                from_agent="orchestrator",
+                to_agent=target_name,
+                msg_type="blocker",
+                subject=f"{agent.state.name} stuck after {agent.state.consecutive_errors} errors",
+                body=body,
+            )
+        )
+        self._emit(
+            "agent_error_escalated",
+            {
+                "agent": agent.state.name,
+                "supervisor": target_name,
+                "consecutive_errors": agent.state.consecutive_errors,
+                "last_error": error,
+            },
+        )
 
     def _acquire_cwd(self, agent: Agent) -> Path:
         """Acquire and remember the per-agent cwd for this turn. Failures
@@ -642,6 +749,19 @@ class Orchestrator:
             s = agent.state
             if s.status == "thinking":
                 continue
+            # Consecutive-error backoff: skip this agent until enough ticks
+            # have elapsed since their last error. min(consecutive_errors,
+            # ERROR_BACKOFF_TICKS) means 1 tick after first error, 2 after
+            # second, capped at ERROR_BACKOFF_TICKS to keep the wait bounded.
+            # We compare against `_tick_count` rather than `_global_turns` so
+            # the window ages even when no other agent dispatched in between.
+            if (
+                s.consecutive_errors
+                and s.last_error_at_turn is not None
+                and (self._tick_count - s.last_error_at_turn)
+                < min(s.consecutive_errors, ERROR_BACKOFF_TICKS)
+            ):
+                continue
             if s.status == "complete":
                 if s.turns_taken < MAX_TURNS_PER_AGENT and any(
                     m.msg_type in self.REACTIVATING_MSG_TYPES for m in s.inbox
@@ -674,6 +794,24 @@ class Orchestrator:
                 if s.blocked_turns >= ESCALATION_AFTER_BLOCKED_TURNS:
                     self._auto_escalate(agent)
         return ready
+
+    def _any_agent_in_error_backoff(self) -> bool:
+        """True if at least one not-yet-given-up agent is currently being
+        skipped purely because of the error backoff window. Used by the
+        main loop to keep ticking instead of declaring stall while the
+        backoff plays out — the next tick will age the window."""
+        for agent in self.agents.values():
+            s = agent.state
+            if s.status == "complete":
+                continue
+            if (
+                s.consecutive_errors
+                and s.last_error_at_turn is not None
+                and (self._tick_count - s.last_error_at_turn)
+                < min(s.consecutive_errors, ERROR_BACKOFF_TICKS)
+            ):
+                return True
+        return False
 
     def _unblock_stalled(self) -> bool:
         """Best-effort sweep when no one is ready: if any agent has been
@@ -1654,6 +1792,7 @@ def _message_from_dict(d: dict[str, Any]) -> Message:
 def _agent_state_from_dict(d: dict[str, Any]) -> AgentState:
     role = Role(d["role"])
     usage_d = d.get("usage") or {}
+    last_error_at = d.get("last_error_at_turn")
     return AgentState(
         name=d["name"],
         role=role,
@@ -1666,6 +1805,8 @@ def _agent_state_from_dict(d: dict[str, Any]) -> AgentState:
         files_touched=list(d.get("files_touched") or []),
         turns_taken=int(d.get("turns_taken") or 0),
         blocked_turns=int(d.get("blocked_turns") or 0),
+        consecutive_errors=int(d.get("consecutive_errors") or 0),
+        last_error_at_turn=int(last_error_at) if last_error_at is not None else None,
         notes=list(d.get("notes") or []),
         usage=TokenUsage(
             input_tokens=int(usage_d.get("input_tokens") or 0),
