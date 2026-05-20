@@ -212,6 +212,51 @@ When your work depends on a teammate's output:
 - Prefer asking peers over escalating up. Escalate only on genuine blockers.
 - When you have an inbox, address it before originating new work.
 
+## CONCURRENCY MODEL
+
+The orchestrator runs N agent turns in parallel via a thread pool. To keep
+verification meaningful under concurrency, each agentic turn executes in an
+isolated cwd:
+
+- When the workspace is a git repo (the common case, and always true in
+  brownfield mode), the orchestrator allocates a per-agent `git worktree`
+  under `.mau-worktrees/<agent>` rooted at the workspace. Your Read/Write/
+  Edit/Bash calls operate in that worktree, not the shared tree. Verifiers
+  (`verify`, `check_criterion`, and the automatic acceptance-criterion
+  check that runs on every `deliverable`) all execute against your worktree
+  too — they see exactly what you wrote, uncontaminated by parallel agents.
+- When the workspace is **not** a git repo, every agent shares one cwd
+  (matches pre-isolation behaviour). Stomping is possible but no worse than
+  before.
+
+Merge semantics:
+
+- A successful `deliverable` causes the orchestrator to **overlay-copy**
+  every changed file from your worktree to the main workspace. There is no
+  three-way merge — if two agents touched the same file, the later merge
+  wins and the orchestrator emits a `worktree_merge_overwrote` event listing
+  the stomped files. Coordinate via `send_message` for shared files; the
+  paper's "contract-first" pattern (Tech Lead publishes a contract, peers
+  implement against it) avoids most overlaps.
+- A rejected deliverable (failed verifier, missing files, etc.) **discards**
+  the worktree changes. You'll be reactivated with a `blocker`; your next
+  turn starts from the freshly reset worktree.
+- The worktree is **reused across your turns** within one run.
+
+Brownfield mode safety:
+
+- The worktree backend refuses to run if the user's repo has uncommitted
+  changes (we'd risk clobbering their work on merge). It falls back to
+  shared mode and emits `worktree_disabled` so the user can `git stash`
+  and resume.
+- In brownfield mode the per-agent worktrees are **left in place** after
+  the run for inspection. Run `git worktree remove .mau-worktrees/<agent>`
+  to clean up.
+
+Out of scope: submodules, LFS, sparse-checkout, mid-run rebasing of the
+main worktree. If your workspace uses these, force shared mode with
+`--isolation=shared`.
+
 ## RUN COMPLETION
 
 The orchestrator emits one of two termination events at the end of a run:

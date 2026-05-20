@@ -116,6 +116,15 @@ SPLASH = r"""
     "'task:<id>=<rule>' to scope. e.g. --policy 'no force-pushes to main' "
     "--policy 'role:devops=always run db migration plan before deploy'.",
 )
+@click.option(
+    "--isolation",
+    type=click.Choice(["auto", "shared", "worktree"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Per-agent isolation backend. 'auto' uses git worktrees when the "
+    "workspace is a git repo, else shared. 'shared' forces the legacy "
+    "single-cwd mode. 'worktree' fails if the workspace isn't a git repo.",
+)
 @click.version_option(version=__version__, prog_name="mau")
 def main(
     request: tuple[str, ...],
@@ -130,6 +139,7 @@ def main(
     no_tui: bool,
     save: Optional[str],
     policies: tuple[str, ...],
+    isolation: str,
 ) -> None:
     console = Console()
     console.print(Text(SPLASH.format(version=__version__), style="bold cyan"))
@@ -206,6 +216,7 @@ def main(
         concurrency=concurrency,
         workspace=workspace,
         max_budget_usd=max_budget_usd,
+        isolation=isolation.lower(),  # type: ignore[arg-type]
     )
 
     if resume_snapshot is not None:

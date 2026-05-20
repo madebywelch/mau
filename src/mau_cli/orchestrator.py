@@ -24,6 +24,11 @@ from typing import Any, Callable, Optional
 
 from mau_cli.agent import Agent
 from mau_cli.inference import InferenceBackend
+from mau_cli.isolation import (
+    IsolationBackend,
+    IsolationMode,
+    make_isolation_backend,
+)
 from mau_cli.message_bus import MessageBus
 from mau_cli.schemas import (
     AcceptanceCriterion,
@@ -74,6 +79,7 @@ class Orchestrator:
         max_budget_usd: Optional[float] = None,
         on_event: Optional[Callable[[str, dict[str, Any]], None]] = None,
         logs_dir: Optional[Path] = None,
+        isolation: IsolationMode = "auto",
     ):
         self.backend = backend
         self.max_turns = max_turns
@@ -95,6 +101,11 @@ class Orchestrator:
         # The "complete" action handler consults this to avoid marking a
         # rejected agent complete (which would freeze them out of `_ready_agents`).
         self._rejected_this_turn: set[str] = set()
+        # Per-turn cwd: the worktree path the agent ran in this tick. Set in
+        # `_safe_turn`, read by `_apply_action` so verifiers run against the
+        # agent's pre-merge tree (the whole point of per-agent isolation).
+        # Cleared between ticks.
+        self._turn_cwd: dict[str, Path] = {}
         # One-shot guards so the same termination event isn't emitted twice
         # from `_is_done` (which is polled on every loop iteration).
         self._turn_cap_announced = False
@@ -114,11 +125,46 @@ class Orchestrator:
         if self.logs_dir is not None:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
 
+        # Per-agent isolation backend. `auto` selects worktrees when the
+        # workspace is inside a git repo, else falls back to shared. We
+        # defer construction so `worktree_disabled` events emit *after*
+        # the caller has wired `on_event` (CLI does that after the
+        # Orchestrator ctor returns). `_ensure_isolation` is idempotent
+        # and called from both `run()` and `resume()`.
+        self._isolation_mode: IsolationMode = isolation
+        self._isolation_initialized = False
+        self.isolation: IsolationBackend  # set in _ensure_isolation
+        from mau_cli.isolation import SharedWorkspaceBackend
+        self.isolation = SharedWorkspaceBackend(
+            Path(workspace.code_dir) if workspace is not None else Path.cwd()
+        )
+
     # ---- public API -------------------------------------------------------
+
+    def _ensure_isolation(self) -> None:
+        """Build the real isolation backend now that `on_event` is wired,
+        so `worktree_disabled` and friends surface to the caller. Called
+        once per session from `run()` / `resume()`."""
+        if self._isolation_initialized:
+            return
+        self._isolation_initialized = True
+        if self.world.workspace is None:
+            return
+        from mau_cli.isolation import make_isolation_backend as _make
+        try:
+            self.isolation = _make(
+                code_dir=Path(self.world.workspace.code_dir),
+                mode=self._isolation_mode,
+                brownfield=self.world.workspace.brownfield,
+                emit=self._emit,
+            )
+        except Exception as e:
+            self._emit("isolation_init_failed", {"error": str(e)})
 
     def run(self, user_request: str) -> WorldState:
         self.world.request = user_request
         self._emit("session_start", {"request": user_request})
+        self._ensure_isolation()
 
         if (
             self.world.workspace is not None
@@ -232,6 +278,7 @@ class Orchestrator:
         (no agents, e.g. soft-resume from a corrupted session.json), seed
         a fresh Product agent so the team can pick up against the existing
         shared docs and workspace files."""
+        self._ensure_isolation()
         if not self.agents:
             request = fallback_request or self.world.request or "(see shared/prd.md)"
             self.world.request = request
@@ -289,6 +336,10 @@ class Orchestrator:
                         break
         finally:
             self._executor.shutdown(wait=False, cancel_futures=True)
+            try:
+                self.isolation.cleanup()
+            except Exception as e:
+                self._emit("worktree_cleanup_error", {"error": str(e)})
 
         if not self.world.final_summary:
             self.world.final_summary = self._build_final_summary()
@@ -488,7 +539,13 @@ class Orchestrator:
         futures: dict[Future, Agent] = {}
         for agent in batch:
             self._global_turns += 1
-            futures[self._executor.submit(self._safe_turn, agent)] = agent
+            # Acquire the per-agent cwd on the orchestrator thread (worktree
+            # creation calls `git`, which we don't want racing inside the
+            # pool). For non-agentic roles, the isolation backend still
+            # hands back a path but no `git` call has to happen — shared
+            # returns code_dir; worktree creates exactly once per agent.
+            cwd = self._acquire_cwd(agent)
+            futures[self._executor.submit(self._safe_turn, agent, cwd)] = agent
 
         # Apply each completed turn synchronously in arrival order.
         for future in list(futures.keys()):
@@ -499,6 +556,8 @@ class Orchestrator:
                 self._emit("agent_error", {"agent": agent.state.name, "error": str(e)})
                 agent.state.status = "blocked"
                 agent.state.notes.append(f"inference error: {e}")
+                # Discard the worktree — turn aborted, nothing to merge.
+                self._release_cwd(agent, merge=False)
                 continue
 
             self._apply_turn(agent, turn)
@@ -510,8 +569,39 @@ class Orchestrator:
 
         return True
 
-    def _safe_turn(self, agent: Agent) -> AgentTurn:
-        return agent.run_turn(self.world)
+    def _acquire_cwd(self, agent: Agent) -> Path:
+        """Acquire and remember the per-agent cwd for this turn. Failures
+        (e.g. git worktree add error) fall back to the shared workspace
+        path so the turn still runs — losing isolation on this tick is
+        better than dropping the agent's work entirely."""
+        try:
+            path = self.isolation.acquire(agent.state.name)
+        except Exception as e:
+            self._emit(
+                "worktree_acquire_failed",
+                {"agent": agent.state.name, "error": str(e)},
+            )
+            if self.world.workspace is not None:
+                path = Path(self.world.workspace.code_dir)
+            else:
+                path = Path.cwd()
+        self._turn_cwd[agent.state.name] = path
+        return path
+
+    def _release_cwd(self, agent: Agent, *, merge: bool) -> None:
+        if agent.state.name not in self._turn_cwd:
+            return
+        try:
+            self.isolation.release(agent.state.name, merge=merge)
+        except Exception as e:
+            self._emit(
+                "worktree_release_failed",
+                {"agent": agent.state.name, "error": str(e), "merge": merge},
+            )
+        self._turn_cwd.pop(agent.state.name, None)
+
+    def _safe_turn(self, agent: Agent, cwd: Path) -> AgentTurn:
+        return agent.run_turn(self.world, cwd=cwd)
 
     # ---- readiness --------------------------------------------------------
 
@@ -622,6 +712,12 @@ class Orchestrator:
             rejected = agent.state.name in self._rejected_this_turn
             self._log_transcript(agent, turn, accepted=not rejected)
 
+            # Merge the agent's worktree back to the main workspace iff this
+            # turn wasn't rejected. Done *after* action application so the
+            # deliverable's verifiers and acceptance-criterion auto-checks
+            # have already run against the pre-merge tree (uncontaminated).
+            self._release_cwd(agent, merge=not rejected)
+
             # If a deliverable was rejected this turn, force the agent back
             # into `working` regardless of any later actions or turn-level status.
             if rejected:
@@ -641,6 +737,7 @@ class Orchestrator:
             a.get("files_touched", []) for a in turn.actions if a.get("type") == "deliverable"
         ]
         flat_files = sorted({f for sub in files_touched for f in (sub or [])})
+        worktree_path = self._turn_cwd.get(agent.state.name)
         record = {
             "turn": agent.state.turns_taken,
             "agent": agent.state.name,
@@ -658,6 +755,8 @@ class Orchestrator:
             "status": turn.status,
             "backend": result.backend,
             "duration_ms": result.duration_ms,
+            "worktree_path": str(worktree_path) if worktree_path else None,
+            "isolation": self.isolation.name,
         }
         try:
             path = self.logs_dir / f"{agent.state.name}.jsonl"
@@ -668,16 +767,19 @@ class Orchestrator:
 
     # ---- workspace-aware helpers ----------------------------------------
 
-    def _verify_files(self, claimed: list[str]) -> list[str]:
+    def _verify_files(
+        self, claimed: list[str], cwd: Optional[Path] = None
+    ) -> list[str]:
         """Return paths that the agent claimed but don't exist on disk
         within the workspace. Paths outside the workspace are also flagged.
 
-        Delegates to PathExistsVerifier so the verify-action path and the
-        deliverable-check path share one implementation of the containment +
-        existence rules."""
+        Runs against the agent's worktree (passed as `cwd`) so we catch
+        "claimed but never written" before merging the worktree into the
+        shared tree. Falls back to the workspace root for callers without
+        per-agent context (e.g. legacy paths)."""
         if not claimed or self.world.workspace is None:
             return []
-        ws_root = Path(self.world.workspace.code_dir)
+        ws_root = cwd or Path(self.world.workspace.code_dir)
         result = VERIFIERS["path_exists"].run({"paths": list(claimed)}, ws_root)
         return list(result.details.get("missing") or [])
 
@@ -762,7 +864,8 @@ class Orchestrator:
                 )
                 return
             files = list(action.get("files_touched", []) or [])
-            missing = self._verify_files(files)
+            cwd = self._turn_cwd.get(agent.state.name)
+            missing = self._verify_files(files, cwd=cwd)
             if missing:
                 agent.state.notes.append(
                     f"deliverable rejected — claimed files missing on disk: {missing}"
@@ -793,7 +896,7 @@ class Orchestrator:
             # as a verify-action failure so the agent gets reactivated.
             target_task = self._first_open_assigned_task(agent)
             if target_task is not None:
-                failures = self._check_task_criteria(target_task)
+                failures = self._check_task_criteria(target_task, cwd=cwd)
                 if failures:
                     self._reject_deliverable_for_criteria(agent, target_task, failures)
                     return
@@ -949,10 +1052,12 @@ class Orchestrator:
             self._emit("unknown_action", {"agent": agent.state.name, "type": action_type})
 
     def _dispatch_verify(self, agent: Agent, action: dict[str, Any]) -> None:
-        """Run the named verifier against the workspace. Failures surface as
-        blocker messages (same channel as a rejected deliverable) and flip
-        the per-turn rejection bit so transcripts mark the turn as not
-        accepted."""
+        """Run the named verifier against the agent's worktree. Running against
+        the worktree (not the shared workspace) is the whole point of per-agent
+        isolation — we see what the agent just produced before it merges.
+        Failures surface as blocker messages (same channel as a rejected
+        deliverable) and flip the per-turn rejection bit so transcripts mark
+        the turn as not accepted."""
         verifier_name = str(action.get("verifier", "")).strip()
         spec = action.get("spec") or {}
         if not isinstance(spec, dict):
@@ -982,7 +1087,9 @@ class Orchestrator:
             )
             return
 
-        ws_root = Path(self.world.workspace.code_dir)
+        ws_root = self._turn_cwd.get(agent.state.name) or Path(
+            self.world.workspace.code_dir
+        )
         try:
             result = verifier.run(spec, ws_root)
         except Exception as e:
@@ -1096,10 +1203,16 @@ class Orchestrator:
         return None
 
     def _run_criterion(
-        self, criterion: AcceptanceCriterion
+        self,
+        criterion: AcceptanceCriterion,
+        cwd: Optional[Path] = None,
     ) -> Optional[VerifierResult]:
         """Run a criterion's verifier (if any) and write the outcome back
-        onto the criterion. Returns the result, or None if no verifier."""
+        onto the criterion. Returns the result, or None if no verifier.
+
+        `cwd` is the agent's worktree when invoked from the deliverable path;
+        for ad-hoc `check_criterion` actions outside an active turn we fall
+        back to the shared workspace."""
         if not criterion.verifier:
             return None
         verifier = VERIFIERS.get(criterion.verifier)
@@ -1110,7 +1223,7 @@ class Orchestrator:
             return VerifierResult(ok=False, summary=criterion.last_summary)
         if self.world.workspace is None:
             return None
-        ws_root = Path(self.world.workspace.code_dir)
+        ws_root = cwd or Path(self.world.workspace.code_dir)
         spec = dict(criterion.spec or {})
         try:
             result = verifier.run(spec, ws_root)
@@ -1124,16 +1237,19 @@ class Orchestrator:
         return result
 
     def _check_task_criteria(
-        self, task: Task
+        self,
+        task: Task,
+        cwd: Optional[Path] = None,
     ) -> list[tuple[int, AcceptanceCriterion, VerifierResult]]:
         """Run every criterion-attached verifier for `task`. Returns the
         failing (index, criterion, result) tuples — empty list means all
-        passed (or there were no verifiers attached)."""
+        passed (or there were no verifiers attached). `cwd` is the agent's
+        worktree so checks see the pre-merge state."""
         failures: list[tuple[int, AcceptanceCriterion, VerifierResult]] = []
         for idx, criterion in enumerate(task.acceptance_criteria):
             if not criterion.verifier:
                 continue
-            result = self._run_criterion(criterion)
+            result = self._run_criterion(criterion, cwd=cwd)
             if result is None:
                 continue
             payload = {
@@ -1231,7 +1347,8 @@ class Orchestrator:
                 },
             )
             return
-        result = self._run_criterion(criterion)
+        cwd = self._turn_cwd.get(agent.state.name)
+        result = self._run_criterion(criterion, cwd=cwd)
         if result is None:
             return
         payload = {

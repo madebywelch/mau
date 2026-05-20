@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 from importlib import resources
+from pathlib import Path
+from typing import Optional
 
 from mau_cli.inference import InferenceBackend, InferenceResult
 from mau_cli.schemas import (
@@ -229,10 +231,12 @@ class Agent:
 
     # ---- turn dispatch --------------------------------------------------
 
-    def run_turn(self, world: WorldState) -> AgentTurn:
+    def run_turn(
+        self, world: WorldState, cwd: Optional[Path] = None
+    ) -> AgentTurn:
         prompt = self.build_user_prompt(world)
         if self.is_code_gen and world.workspace is not None:
-            result = self._run_agentic(world, prompt)
+            result = self._run_agentic(world, prompt, cwd=cwd)
         else:
             result = self.backend.call_plan(self.system_prompt, prompt)
             self.state.usage.add(result.usage)
@@ -251,13 +255,23 @@ class Agent:
         self.state.turns_taken += 1
         return turn
 
-    def _run_agentic(self, world: WorldState, prompt: str) -> InferenceResult:
+    def _run_agentic(
+        self,
+        world: WorldState,
+        prompt: str,
+        cwd: Optional[Path] = None,
+    ) -> InferenceResult:
+        """Run the agentic backend in the per-agent worktree when `cwd` is
+        supplied (the orchestrator owns acquire/release). Falls back to the
+        shared workspace dir when no isolation context is provided so
+        backend tests still work outside the orchestrator."""
         ws = world.workspace
         assert ws is not None
+        workspace_dir = str(cwd) if cwd is not None else ws.code_dir
         result = self.backend.call_agentic(
             system_prompt=self.system_prompt,
             user_prompt=prompt,
-            workspace_dir=ws.code_dir,
+            workspace_dir=workspace_dir,
             extra_dirs=[ws.shared_dir],
         )
         self.state.usage.add(result.usage)
