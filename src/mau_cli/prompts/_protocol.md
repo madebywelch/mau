@@ -89,6 +89,36 @@ types listed here are valid; unknown types are ignored.
   ```
   { "type": "write_doc", "name": "api-contract.md", "content": "<full content>" }
   ```
+- `verify` — invoke a deterministic sensor against the workspace. On
+  failure the orchestrator delivers a `blocker` back to you (same channel
+  as a rejected deliverable) and the turn is marked rejected, so any
+  trailing `complete` is ignored and you'll be reactivated to fix the gap.
+  Built-in verifiers:
+  - `path_exists` — `spec: {"paths": ["a", "b"]}`. All paths must exist
+    inside the workspace.
+  - `run_command` — `spec: {"command": "pytest -q", "cwd": "subdir",
+    "timeout_seconds": 60, "expected_exit": 0}`. Runs via shell; non-zero
+    exit (or a timeout) fails. `cwd` is workspace-relative.
+  - `parse_contract` — `spec: {"path": "src/foo.py"}`. Parses one file
+    based on extension: `.py` via `ast.parse`, `.json` via `json.loads`,
+    `.yaml/.yml` via PyYAML if installed (skipped otherwise), `.ts/.tsx/
+    .js/.mjs/.cjs` via `node --check` if `node` is on `PATH` (skipped
+    otherwise).
+  ```
+  { "type": "verify",
+    "verifier": "run_command",
+    "spec": { "command": "pytest -q", "timeout_seconds": 60 } }
+  ```
+  Specialists can also attach verifiers to their final DELIVERABLE block
+  by adding a `verify` array; each entry runs BEFORE the deliverable is
+  recorded so a failure rejects the deliverable too:
+  ```
+  <DELIVERABLE>{"title": "...", "summary": "...",
+   "files_touched": ["..."],
+   "verify": [{"verifier": "parse_contract", "spec": {"path": "server/items.py"}},
+              {"verifier": "run_command",   "spec": {"command": "pytest -q tests/test_items.py"}}]}
+  </DELIVERABLE>
+  ```
 
 ## CHAIN-OF-COMMAND
 

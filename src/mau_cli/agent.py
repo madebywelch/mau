@@ -226,10 +226,22 @@ class Agent:
                 ],
             )
 
-        return AgentTurn(
-            thoughts=str(deliverable.get("summary", ""))[:500],
-            status="complete",
-            actions=[
+        actions: list[dict[str, object]] = []
+        # Optional: specialists can request verifiers as part of their
+        # deliverable. They run BEFORE the deliverable so failures can
+        # mark the turn rejected and short-circuit "complete".
+        for v in deliverable.get("verify") or []:
+            if not isinstance(v, dict):
+                continue
+            actions.append(
+                {
+                    "type": "verify",
+                    "verifier": v.get("verifier", ""),
+                    "spec": v.get("spec") or {},
+                }
+            )
+        actions.extend(
+            [
                 {
                     "type": "deliverable",
                     "title": deliverable.get("title", "Deliverable"),
@@ -237,5 +249,10 @@ class Agent:
                     "files_touched": result.files_touched,
                 },
                 {"type": "complete", "summary": deliverable.get("summary", "")},
-            ],
+            ]
+        )
+        return AgentTurn(
+            thoughts=str(deliverable.get("summary", ""))[:500],
+            status="complete",
+            actions=actions,
         )

@@ -176,6 +176,7 @@ ActionType = Literal[
     "complete",
     "note",
     "ask_user",
+    "verify",
 ]
 
 

@@ -38,6 +38,7 @@ from mau_cli.schemas import (
     _id,
     now,
 )
+from mau_cli.verifiers import VERIFIERS, VerifierResult
 
 
 # Tunable limits. Conservative by default to keep token spend bounded.
@@ -544,21 +545,16 @@ class Orchestrator:
 
     def _verify_files(self, claimed: list[str]) -> list[str]:
         """Return paths that the agent claimed but don't exist on disk
-        within the workspace. Paths outside the workspace are also flagged."""
+        within the workspace. Paths outside the workspace are also flagged.
+
+        Delegates to PathExistsVerifier so the verify-action path and the
+        deliverable-check path share one implementation of the containment +
+        existence rules."""
         if not claimed or self.world.workspace is None:
             return []
-        ws_root = Path(self.world.workspace.code_dir).resolve()
-        missing: list[str] = []
-        for raw in claimed:
-            try:
-                full = (ws_root / raw).resolve()
-                full.relative_to(ws_root)  # must be inside workspace
-            except (ValueError, OSError):
-                missing.append(raw)
-                continue
-            if not full.exists():
-                missing.append(raw)
-        return missing
+        ws_root = Path(self.world.workspace.code_dir)
+        result = VERIFIERS["path_exists"].run({"paths": list(claimed)}, ws_root)
+        return list(result.details.get("missing") or [])
 
     def _apply_action(self, agent: Agent, action: dict[str, Any]) -> None:
         action_type = action.get("type")
@@ -632,6 +628,15 @@ class Orchestrator:
             self._spawn_agent(role, name, specialization)
 
         elif action_type == "deliverable":
+            # If a prior verify in this same turn failed, refuse to record the
+            # deliverable. The verifier already delivered a blocker; recording
+            # the deliverable would mark the task complete despite the failure.
+            if agent.state.name in self._rejected_this_turn:
+                self._emit(
+                    "deliverable_rejected",
+                    {"agent": agent.state.name, "reason": "verify failed earlier this turn"},
+                )
+                return
             files = list(action.get("files_touched", []) or [])
             missing = self._verify_files(files)
             if missing:
@@ -748,8 +753,88 @@ class Orchestrator:
         elif action_type == "note":
             agent.state.notes.append(str(action.get("body", ""))[:500])
 
+        elif action_type == "verify":
+            self._dispatch_verify(agent, action)
+
         else:
             self._emit("unknown_action", {"agent": agent.state.name, "type": action_type})
+
+    def _dispatch_verify(self, agent: Agent, action: dict[str, Any]) -> None:
+        """Run the named verifier against the workspace. Failures surface as
+        blocker messages (same channel as a rejected deliverable) and flip
+        the per-turn rejection bit so transcripts mark the turn as not
+        accepted."""
+        verifier_name = str(action.get("verifier", "")).strip()
+        spec = action.get("spec") or {}
+        if not isinstance(spec, dict):
+            self._emit(
+                "verify_invalid",
+                {"agent": agent.state.name, "reason": "spec must be an object"},
+            )
+            return
+
+        verifier = VERIFIERS.get(verifier_name)
+        if verifier is None:
+            self._emit(
+                "verify_invalid",
+                {
+                    "agent": agent.state.name,
+                    "verifier": verifier_name,
+                    "known": sorted(VERIFIERS.keys()),
+                },
+            )
+            agent.state.notes.append(f"verify: unknown verifier {verifier_name!r}")
+            return
+
+        if self.world.workspace is None:
+            self._emit(
+                "verify_skipped",
+                {"agent": agent.state.name, "reason": "no workspace"},
+            )
+            return
+
+        ws_root = Path(self.world.workspace.code_dir)
+        try:
+            result = verifier.run(spec, ws_root)
+        except Exception as e:
+            result = VerifierResult(
+                ok=False,
+                summary=f"verifier crashed: {e}",
+                details={"error": str(e)},
+            )
+
+        payload = {
+            "agent": agent.state.name,
+            "verifier": verifier_name,
+            "ok": result.ok,
+            "summary": result.summary,
+        }
+        if result.ok:
+            self._emit("verify_passed", payload)
+            agent.state.notes.append(
+                f"verify ok ({verifier_name}): {result.summary}"
+            )
+            return
+
+        self._emit("verify_failed", {**payload, "details": result.details})
+        agent.state.notes.append(
+            f"verify failed ({verifier_name}): {result.summary}"
+        )
+        self._rejected_this_turn.add(agent.state.name)
+        self.bus.deliver(
+            Message(
+                from_agent="orchestrator",
+                to_agent=agent.state.name,
+                msg_type="blocker",
+                subject=f"Verify failed: {verifier_name}",
+                body=(
+                    f"Your `verify` action using `{verifier_name}` failed:\n"
+                    f"{result.summary}\n\n"
+                    f"Spec: {json.dumps(spec, default=str)[:600]}\n"
+                    "Address the failure and re-run the verifier before claiming done."
+                ),
+            )
+        )
 
     # ---- helpers ----------------------------------------------------------
 
