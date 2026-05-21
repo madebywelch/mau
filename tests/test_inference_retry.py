@@ -10,9 +10,8 @@ surface immediately.
 from __future__ import annotations
 
 import json
-import subprocess
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,10 +22,12 @@ from mau_cli.inference import (
 )
 
 
-def _proc(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(
-        args=["claude"], returncode=returncode, stdout=stdout, stderr=stderr
-    )
+def _proc(returncode: int, stdout: str = "", stderr: str = "") -> tuple[Any, str, str]:
+    """Return the (proc, stdout, stderr) shape that `_run_with_group_kill`
+    produces. Only `returncode` matters on the proc itself."""
+    fake_proc = MagicMock()
+    fake_proc.returncode = returncode
+    return (fake_proc, stdout, stderr)
 
 
 def _transient_envelope() -> dict[str, Any]:
@@ -59,9 +60,10 @@ def test_claude_retries_then_succeeds_on_transient_envelope():
     good = _proc(0, stdout=json.dumps(_good_envelope()))
 
     backend = ClaudeCLIBackend()
-    with patch("subprocess.run", side_effect=[bad, bad, good]) as run_mock, patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill",
+        side_effect=[bad, bad, good],
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
         envelope, raw, _ = backend._invoke(["claude"])
 
     assert envelope.get("result")
@@ -76,9 +78,9 @@ def test_claude_on_retry_callback_invoked():
 
     seen: list[dict[str, Any]] = []
     backend = ClaudeCLIBackend(on_retry=lambda payload: seen.append(payload))
-    with patch("subprocess.run", side_effect=[bad, good]), patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill", side_effect=[bad, good]
+    ), patch("mau_cli.inference._time.sleep"):
         backend._invoke(["claude"])
 
     assert len(seen) == 1
@@ -99,9 +101,9 @@ def test_claude_does_not_retry_on_non_transient_exit_1():
     bad = _proc(1, stdout=json.dumps(non_transient), stderr="bad flag")
 
     backend = ClaudeCLIBackend()
-    with patch("subprocess.run", side_effect=[bad]) as run_mock, patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill", side_effect=[bad]
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
         with pytest.raises(RuntimeError) as exc:
             backend._invoke(["claude"])
 
@@ -116,9 +118,9 @@ def test_claude_does_not_retry_when_stdout_is_not_json():
     bad = _proc(1, stdout="oops not json", stderr="something exploded")
 
     backend = ClaudeCLIBackend()
-    with patch("subprocess.run", side_effect=[bad]) as run_mock, patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill", side_effect=[bad]
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
         with pytest.raises(RuntimeError) as exc:
             backend._invoke(["claude"])
 
@@ -133,9 +135,10 @@ def test_claude_exhausts_retries_when_always_transient():
 
     backend = ClaudeCLIBackend()
     expected_attempts = 1 + len(CLAUDE_RETRY_BACKOFF_SECONDS)
-    with patch("subprocess.run", side_effect=[bad] * expected_attempts) as run_mock, patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill",
+        side_effect=[bad] * expected_attempts,
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
         with pytest.raises(RuntimeError) as exc:
             backend._invoke(["claude"])
 
@@ -157,9 +160,9 @@ def test_claude_retries_on_explicit_error_subtype():
     good = _proc(0, stdout=json.dumps(_good_envelope()))
 
     backend = ClaudeCLIBackend()
-    with patch("subprocess.run", side_effect=[bad, good]) as run_mock, patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill", side_effect=[bad, good]
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
         envelope, _, _ = backend._invoke(["claude"])
 
     assert run_mock.call_count == 2
@@ -175,9 +178,9 @@ def test_codex_retries_on_transient_stderr_then_succeeds():
     good = _proc(0, stdout="hello\n<DELIVERABLE>{\"files_touched\":[]}</DELIVERABLE>")
 
     backend = CodexCLIBackend()
-    with patch("subprocess.run", side_effect=[bad, good]) as run_mock, patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill", side_effect=[bad, good]
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
         result = backend.call_agentic("sys", "u", workspace_dir="/tmp")
 
     assert run_mock.call_count == 2
@@ -190,9 +193,9 @@ def test_codex_does_not_retry_on_real_error():
     bad = _proc(1, stderr="syntax error in prompt: unexpected token")
 
     backend = CodexCLIBackend()
-    with patch("subprocess.run", side_effect=[bad]) as run_mock, patch(
-        "mau_cli.inference._time.sleep"
-    ):
+    with patch(
+        "mau_cli.inference._run_with_group_kill", side_effect=[bad]
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
         with pytest.raises(RuntimeError) as exc:
             backend.call_agentic("sys", "u", workspace_dir="/tmp")
 

@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time as _time
@@ -34,6 +35,59 @@ from mau_cli.schemas import TokenUsage
 # 1-3s gap is enough for whatever rate-limit / concurrent-session conflict
 # triggered it to clear.
 CLAUDE_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0)
+
+# Hard cap on a single claude/codex invocation. `subprocess.run(timeout=...)`
+# only kills the immediate child; MCP-server grandchildren keep pipes open and
+# the call hangs indefinitely. We run in a new process group and kill the
+# whole tree on timeout — see `_run_with_group_kill`.
+CLAUDE_INVOKE_TIMEOUT_SECONDS: int = 1800
+
+
+def _run_with_group_kill(
+    cmd: list[str],
+    *,
+    cwd: Optional[str],
+    env: Optional[dict[str, str]],
+    timeout: int,
+) -> tuple[subprocess.Popen[str], str, str]:
+    """Run `cmd` in its own process group; SIGTERM/SIGKILL the group on timeout.
+
+    Returns (proc, stdout, stderr). Raises RuntimeError on timeout so the
+    orchestrator's existing exception path surfaces it as `agent_error`."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        cwd=cwd,
+        env=env,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc, stdout, stderr
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except Exception:
+            stdout, stderr = "", ""
+        raise RuntimeError(
+            f"claude CLI timed out after {timeout}s "
+            f"(stdout_tail={(stdout or '')[-200:]!r})"
+        )
 
 # Heuristic markers in codex stderr that suggest a retryable issue rather than
 # a malformed prompt. Matched case-insensitively.
@@ -171,6 +225,11 @@ class ClaudeCLIBackend(InferenceBackend):
             "--output-format", "json",
             "--append-system-prompt", system_prompt,
             "--disallowedTools", _AGENTIC_TOOLS,  # plan mode: no tools
+            # Avoid session-file lock contention when many planners run in
+            # parallel; plan mode is a one-shot and we never resume it.
+            "--no-session-persistence",
+            # Plan mode doesn't use tools, so cap internal iteration at 1.
+            "--max-turns", "1",
         ]
         if self.model:
             cmd += ["--model", self.model]
@@ -206,6 +265,9 @@ class ClaudeCLIBackend(InferenceBackend):
             "--permission-mode", "bypassPermissions",
             "--append-system-prompt", system_prompt,
             "--allowedTools", _AGENTIC_TOOLS,
+            # Avoid session-file lock contention when many agents run in
+            # parallel; specialists never resume sessions cross-turn.
+            "--no-session-persistence",
         ]
         for d in (extra_dirs or []):
             cmd += ["--add-dir", d]
@@ -240,43 +302,41 @@ class ClaudeCLIBackend(InferenceBackend):
         # indicates no actual model output happened (transient backend flake).
         # A real failure — invalid prompt, unknown flag, anything where stdout
         # isn't a parseable envelope or where the envelope contains substantive
-        # content — raises on the first attempt.
+        # content — raises on the first attempt. Timeouts (from group-kill) are
+        # also non-retryable: a 30-min wedge isn't going to clear in 1-3s.
         last_err: Optional[str] = None
         attempts = [0.0, *CLAUDE_RETRY_BACKOFF_SECONDS]
         for attempt, delay in enumerate(attempts):
             if delay:
                 _time.sleep(delay)
             start = _time.monotonic()
-            proc = subprocess.run(
+            proc, stdout, stderr = _run_with_group_kill(
                 cmd,
-                capture_output=True,
-                text=True,
                 cwd=cwd,
-                stdin=subprocess.DEVNULL,  # don't block on stdin
-                timeout=900,
                 env={**os.environ, "CLAUDE_CODE_DISABLE_TELEMETRY": "1"},
+                timeout=CLAUDE_INVOKE_TIMEOUT_SECONDS,
             )
             duration_ms = int((_time.monotonic() - start) * 1000)
 
             if proc.returncode == 0:
                 try:
-                    envelope = json.loads(proc.stdout)
+                    envelope = json.loads(stdout)
                 except json.JSONDecodeError:
-                    envelope = {"result": proc.stdout}
-                return envelope, proc.stdout, duration_ms
+                    envelope = {"result": stdout}
+                return envelope, stdout, duration_ms
 
             envelope: Optional[dict[str, Any]] = None
             try:
-                envelope = json.loads(proc.stdout)
+                envelope = json.loads(stdout)
             except json.JSONDecodeError:
                 envelope = None
 
             if envelope is not None and self._envelope_is_transient(envelope):
-                last_err = self._format_error(proc, envelope, attempt)
+                last_err = self._format_error(proc.returncode, stdout, stderr, envelope, attempt)
                 self._notify_retry(attempt, last_err, envelope)
                 continue
 
-            raise RuntimeError(self._format_error(proc, envelope, attempt))
+            raise RuntimeError(self._format_error(proc.returncode, stdout, stderr, envelope, attempt))
 
         raise RuntimeError(f"claude CLI exhausted retries: {last_err}")
 
@@ -321,9 +381,13 @@ class ClaudeCLIBackend(InferenceBackend):
 
     @staticmethod
     def _format_error(
-        proc: subprocess.CompletedProcess, envelope: Optional[dict[str, Any]], attempt: int
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        envelope: Optional[dict[str, Any]],
+        attempt: int,
     ) -> str:
-        stderr_tail = (proc.stderr or "").strip()[-400:]
+        stderr_tail = (stderr or "").strip()[-400:]
         if envelope is not None:
             keys = (
                 "subtype",
@@ -335,12 +399,12 @@ class ClaudeCLIBackend(InferenceBackend):
             )
             snapshot = {k: envelope.get(k) for k in keys if k in envelope}
             return (
-                f"claude CLI exit={proc.returncode} (attempt={attempt}) "
+                f"claude CLI exit={returncode} (attempt={attempt}) "
                 f"envelope={snapshot} stderr={stderr_tail!r}"
             )
-        stdout_tail = (proc.stdout or "").strip()[-300:]
+        stdout_tail = (stdout or "").strip()[-300:]
         return (
-            f"claude CLI exit={proc.returncode} (attempt={attempt}) "
+            f"claude CLI exit={returncode} (attempt={attempt}) "
             f"stderr={stderr_tail!r} stdout_tail={stdout_tail!r}"
         )
 
@@ -400,13 +464,16 @@ class CodexCLIBackend(InferenceBackend):
         last_err: Optional[str] = None
         for attempt in (0, 1):
             start = _time.monotonic()
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, cwd=cwd, timeout=900
+            proc, stdout, stderr = _run_with_group_kill(
+                cmd,
+                cwd=cwd,
+                env=None,
+                timeout=CLAUDE_INVOKE_TIMEOUT_SECONDS,
             )
             duration_ms = int((_time.monotonic() - start) * 1000)
 
             if proc.returncode == 0:
-                text = proc.stdout
+                text = stdout
                 if plan:
                     parsed = extract_json(text)
                     files = []
@@ -424,9 +491,9 @@ class CodexCLIBackend(InferenceBackend):
 
             last_err = (
                 f"codex CLI exit={proc.returncode} (attempt={attempt}): "
-                f"{(proc.stderr or '').strip()[:300]}"
+                f"{(stderr or '').strip()[:300]}"
             )
-            if attempt == 0 and self._stderr_looks_transient(proc.stderr or ""):
+            if attempt == 0 and self._stderr_looks_transient(stderr or ""):
                 self._notify_retry(attempt, last_err)
                 _time.sleep(1.0)
                 continue
