@@ -169,6 +169,32 @@ def test_claude_retries_on_explicit_error_subtype():
     assert envelope.get("result")
 
 
+def test_claude_does_not_retry_on_error_max_turns():
+    """`error_max_turns` is deterministic — when it comes from our own argv
+    cap it would just fail again on retry; when it comes from claude's
+    default cap the prompt itself drives unbounded iteration and retrying
+    burns budget. Regression: an earlier Bug 6 fix put this subtype on the
+    retry list, and a real $20 production run exhausted retries on every
+    plan turn until it was removed."""
+    not_transient = {
+        "is_error": True,
+        "subtype": "error_max_turns",
+        "terminal_reason": "max_turns",
+        "iterations": [{"step": 1}],
+        "modelUsage": {"model": "x"},
+    }
+    bad = _proc(1, stdout=json.dumps(not_transient))
+
+    backend = ClaudeCLIBackend()
+    with patch(
+        "mau_cli.inference._run_with_group_kill", side_effect=[bad]
+    ) as run_mock, patch("mau_cli.inference._time.sleep"):
+        with pytest.raises(RuntimeError):
+            backend._invoke(["claude"])
+
+    assert run_mock.call_count == 1, "must not retry error_max_turns"
+
+
 # ---- Bug 4 (codex side): coarser stderr-marker retry ----------------------
 
 

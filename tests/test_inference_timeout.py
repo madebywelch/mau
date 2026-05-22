@@ -6,7 +6,9 @@ the CLI in a fresh process group via `start_new_session=True` and SIGTERM /
 SIGKILL the group on `TimeoutExpired`. These tests cover:
 
 1. `_run_with_group_kill` actually reaps grandchildren by PID.
-2. Plan-mode command includes `--no-session-persistence` and `--max-turns 1`.
+2. Plan-mode command includes `--no-session-persistence` and does NOT cap
+   `--max-turns` (opus can need >1 internal iteration even without tools;
+   self-imposed caps cause deterministic `error_max_turns` failures).
 3. Agentic-mode command includes `--no-session-persistence`.
 4. Happy-path (exit-0 + valid envelope) still returns through the new helper.
 """
@@ -121,11 +123,15 @@ def _capture_popen_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     return seen
 
 
-def test_call_plan_passes_no_session_persistence_and_max_turns(
+def test_call_plan_passes_no_session_persistence_and_no_self_imposed_turn_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Plan mode is a one-shot with no tools; we cap turns at 1 and skip
-    writing session state to avoid lock contention under parallelism."""
+    """Plan mode skips session-state writes to avoid lock contention under
+    parallelism. It must NOT pass `--max-turns 1`: opus' adaptive thinking
+    can produce multi-iteration plan responses, and a self-imposed cap
+    triggers deterministic `error_max_turns` failures (regression: the
+    original Bug 6 fix shipped this cap, $20 prod run rejected every plan
+    turn with `error_max_turns` until the cap was removed)."""
     seen = _capture_popen_argv(monkeypatch)
     backend = ClaudeCLIBackend()
     backend.call_plan("sys", "user prompt")
@@ -133,8 +139,11 @@ def test_call_plan_passes_no_session_persistence_and_max_turns(
     assert len(seen) == 1
     cmd = seen[0]
     assert "--no-session-persistence" in cmd
-    # `--max-turns 1` is two consecutive tokens in argv.
-    assert "--max-turns" in cmd and cmd[cmd.index("--max-turns") + 1] == "1"
+    # No self-imposed `--max-turns` cap in plan mode.
+    assert "--max-turns" not in cmd, (
+        "plan-mode commands must not carry a --max-turns cap: opus needs "
+        "headroom for internal thinking iterations"
+    )
 
 
 def test_call_agentic_passes_no_session_persistence(

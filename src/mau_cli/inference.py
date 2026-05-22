@@ -228,8 +228,6 @@ class ClaudeCLIBackend(InferenceBackend):
             # Avoid session-file lock contention when many planners run in
             # parallel; plan mode is a one-shot and we never resume it.
             "--no-session-persistence",
-            # Plan mode doesn't use tools, so cap internal iteration at 1.
-            "--max-turns", "1",
         ]
         if self.model:
             cmd += ["--model", self.model]
@@ -368,12 +366,14 @@ class ClaudeCLIBackend(InferenceBackend):
         Pattern observed in the wild — exit code 1 with a structured envelope
         whose `iterations` and `modelUsage` are empty, or whose error subtype
         explicitly flags an in-execution failure. These reliably clear on
-        retry; real prompt errors don't."""
+        retry; real prompt errors don't.
+
+        `error_max_turns` is deliberately NOT retryable: when the cap comes
+        from our own argv it's deterministic, and when it comes from claude's
+        default it means the prompt itself drives unbounded iteration —
+        retrying just burns budget."""
         subtype = envelope.get("subtype")
-        if envelope.get("is_error") and subtype in {
-            "error_during_execution",
-            "error_max_turns",
-        }:
+        if envelope.get("is_error") and subtype == "error_during_execution":
             return True
         if envelope.get("iterations") == [] and envelope.get("modelUsage") == {}:
             return True
