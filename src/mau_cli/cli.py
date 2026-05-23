@@ -1,9 +1,10 @@
 """CLI entry point — `mau` command.
 
-Two modes:
-  mau "build a user dashboard"     # one-shot, runs to completion
-  mau                              # interactive: prompt for the request,
-                                   # then render the live TUI
+Three surfaces:
+  mau "build a user dashboard"          # one-shot, runs to completion
+  mau                                   # interactive: prompts for the request,
+                                        # then renders the live TUI
+  mau evolve {summarize,propose,regress}  # AHE prototype — see evolution.py
 """
 
 from __future__ import annotations
@@ -21,6 +22,13 @@ from rich.prompt import Prompt
 from rich.text import Text
 
 from mau_cli import __version__
+from mau_cli.evolution import (
+    EvolutionAgent,
+    RegressionSuite,
+    format_proposals,
+    format_regression,
+    format_summary_table,
+)
 from mau_cli.inference import select_backend
 from mau_cli.orchestrator import (
     DEFAULT_CONCURRENCY,
@@ -47,9 +55,49 @@ SPLASH = r"""
 """
 
 
-@click.command(
+# Subcommands users may invoke directly. Anything else passed at the group
+# level (positional or unknown option) is treated as args for `run`, so the
+# original `mau "build a thing"` / `mau --backend mock "..."` invocations
+# keep working after Task 7 turned `mau` into a subcommand group.
+_KNOWN_SUBCOMMANDS = {"run", "evolve"}
+_GROUP_ONLY_FLAGS = {"--help", "-h", "--version"}
+
+
+class _MauGroup(click.Group):
+    """Group that forwards bare requests / unknown flags to `run`.
+
+    Click would otherwise reject `mau --backend mock "..."` because
+    `--backend` isn't a group option. We rewrite the argv so anything that
+    isn't a known subcommand or a recognised group flag gets prepended with
+    `run`, restoring the pre-Task-7 ergonomics.
+    """
+
+    def parse_args(self, ctx, args):  # type: ignore[override]
+        if args:
+            first = args[0]
+            if first not in _KNOWN_SUBCOMMANDS and first not in _GROUP_ONLY_FLAGS:
+                args = ["run", *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group(
     name="mau",
+    cls=_MauGroup,
+    invoke_without_command=True,
     help="MAU-CLI — orchestrate a simulated engineering team via local Claude / Codex.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+@click.version_option(version=__version__, prog_name="mau")
+@click.pass_context
+def main(ctx: click.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        # Bare `mau` with no positional / subcommand → interactive prompt.
+        ctx.invoke(run)
+
+
+@main.command(
+    name="run",
+    help="Run a single orchestration session (the default behaviour).",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 @click.argument("request", required=False, nargs=-1)
@@ -95,7 +143,12 @@ SPLASH = r"""
     "max_budget_usd",
     type=float,
     default=None,
-    help="Hard cap on total spend in USD. Halts the run when reached.",
+    help=(
+        "Hard cap on total spend in USD. The orchestrator refuses to "
+        "dispatch any new agent turn once spend reaches this value, but "
+        "in-flight turns from the prior tick still complete, so the final "
+        "total may overshoot slightly."
+    ),
 )
 @click.option(
     "--no-tui",
@@ -107,8 +160,25 @@ SPLASH = r"""
     type=click.Path(dir_okay=False, writable=True),
     help="Also persist a final session JSON to this extra path (in addition to <workspace>/session.json).",
 )
-@click.version_option(version=__version__, prog_name="mau")
-def main(
+@click.option(
+    "--policy",
+    "policies",
+    multiple=True,
+    help="Durable policy the team must follow for this run (and resumes). "
+    "Repeatable. Format: '<rule>' for global, or 'role:<role>=<rule>' / "
+    "'task:<id>=<rule>' to scope. e.g. --policy 'no force-pushes to main' "
+    "--policy 'role:devops=always run db migration plan before deploy'.",
+)
+@click.option(
+    "--isolation",
+    type=click.Choice(["auto", "shared", "worktree"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Per-agent isolation backend. 'auto' uses git worktrees when the "
+    "workspace is a git repo, else shared. 'shared' forces the legacy "
+    "single-cwd mode. 'worktree' fails if the workspace isn't a git repo.",
+)
+def run(
     request: tuple[str, ...],
     backend: str,
     max_turns: int,
@@ -120,6 +190,8 @@ def main(
     max_budget_usd: Optional[float],
     no_tui: bool,
     save: Optional[str],
+    policies: tuple[str, ...],
+    isolation: str,
 ) -> None:
     console = Console()
     console.print(Text(SPLASH.format(version=__version__), style="bold cyan"))
@@ -196,6 +268,7 @@ def main(
         concurrency=concurrency,
         workspace=workspace,
         max_budget_usd=max_budget_usd,
+        isolation=isolation.lower(),  # type: ignore[arg-type]
     )
 
     if resume_snapshot is not None:
@@ -207,6 +280,7 @@ def main(
                     f"[bold]Agents:[/bold]   {len(orch.agents)} restored\n"
                     f"[bold]Tasks:[/bold]    {len(orch.world.tasks)} restored\n"
                     f"[bold]Messages:[/bold] {len(orch.world.messages)} replayed\n"
+                    f"[bold]Policies:[/bold] {sum(1 for p in orch.world.policies if p.active)} active\n"
                     f"[bold]Spent:[/bold]    {orch.world.usage.short()}"
                 ),
                 border_style="green",
@@ -216,6 +290,16 @@ def main(
         if not rehydrated:
             console.print("[red]Session state had no agents — nothing to resume.[/red]")
             sys.exit(1)
+
+    # Atomically seed --policy entries before the team starts (or resumes).
+    # add_policy dedupes on (text, scope), so re-passing the same flag on
+    # resume is a no-op rather than duplicating the rule.
+    for raw in policies:
+        text, scope = _parse_policy_flag(raw)
+        if not text:
+            console.print(f"[yellow]Skipping empty --policy entry: {raw!r}[/yellow]")
+            continue
+        orch.world.add_policy(text=text, scope=scope, source="user", turn=0)
 
     try:
         if no_tui:
@@ -255,9 +339,31 @@ def main(
                 "\n".join(
                     f"[{m.from_agent}] {m.subject}\n  {m.body}"
                     for m in world.pending_user_questions
-                ),
+                )
+                + "\n\nTip: if your answer is a rule the team should follow "
+                + "going forward, resume with `mau --resume --policy '<rule>'` "
+                + "(or `--policy 'role:devops=<rule>'`) so the rule persists "
+                + "into every future agent prompt.",
                 title="[bold yellow]escalations / questions for you[/bold yellow]",
                 border_style="yellow",
+            )
+        )
+
+    active_policies = [p for p in world.policies if p.active]
+    if active_policies:
+        # Use Text (not a markup string) so policy IDs in square brackets
+        # aren't interpreted as Rich markup tags.
+        body = Text(
+            "\n".join(
+                f"  - [{p.id}] (scope={p.scope}, source={p.source}) {p.text}"
+                for p in active_policies
+            )
+        )
+        console.print(
+            Panel(
+                body,
+                title="[bold]active policies[/bold]",
+                border_style="cyan",
             )
         )
 
@@ -265,6 +371,28 @@ def main(
         path = Path(save)
         path.write_text(json.dumps(world.snapshot(), indent=2, default=str))
         console.print(f"[dim]session saved to {path}[/dim]")
+
+
+def _parse_policy_flag(raw: str) -> tuple[str, str]:
+    """Parse one --policy value into (text, scope).
+
+    Accepts:
+      'rule text'                       → ('rule text', 'global')
+      'role:devops=rule text'           → ('rule text', 'role:devops')
+      'task:task_abc123=rule text'      → ('rule text', 'task:task_abc123')
+      'global=rule text'                → ('rule text', 'global')
+    Returns ('', 'global') for whitespace-only input."""
+    s = raw.strip()
+    if not s:
+        return "", "global"
+    head, sep, rest = s.partition("=")
+    if sep and head.strip() and (
+        head.strip() == "global"
+        or head.strip().startswith("role:")
+        or head.strip().startswith("task:")
+    ):
+        return rest.strip(), head.strip()
+    return s, "global"
 
 
 def _interactive_prompt(console: Console) -> str:
@@ -340,6 +468,146 @@ def _resolve_resume_path(arg: str, console: Console) -> Optional[tuple[str, dict
         return None
 
     return str(ws_root), snapshot
+
+
+# ---- evolve subcommand group ------------------------------------------------
+#
+# Surfaces the Evolution Agent prototype. Each subcommand is read-only against
+# the prompts dir; even `regress` patches a temp copy. Mutations stay gated
+# behind a human review of the printed proposals.
+
+
+def _default_prompts_dir() -> Path:
+    """Resolve the packaged prompts dir. Falls back to the source layout when
+    running from a checkout without an install."""
+    try:
+        return Path(str(__import__("mau_cli.prompts", fromlist=["__file__"]).__file__)).parent
+    except Exception:
+        return Path(__file__).parent / "prompts"
+
+
+def _resolve_logs_dir(explicit: Optional[str]) -> Optional[Path]:
+    """Pick a logs dir to ingest. Honours `--logs-dir` first; otherwise looks
+    for the most recent `./.mau/runs/<ts>/logs/`."""
+    if explicit:
+        return Path(explicit).resolve()
+    runs_dir = Path.cwd() / ".mau" / "runs"
+    if not runs_dir.exists():
+        return None
+    candidates = sorted(
+        (p for p in runs_dir.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for c in candidates:
+        logs = c / "logs"
+        if logs.exists():
+            return logs
+    return None
+
+
+@main.group(
+    name="evolve",
+    help="Agentic Harness Engineering prototype — ingest transcripts and "
+    "propose harness mutations gated by a regression suite.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+def evolve() -> None:
+    pass
+
+
+@evolve.command(
+    name="summarize",
+    help="Print per-agent transcript stats: turns, accept/reject rates, "
+    "tokens, avg duration, and top rejection reasons.",
+)
+@click.option(
+    "--logs-dir",
+    "logs_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory of `<agent>.jsonl` transcripts. Defaults to the most "
+    "recent ./.mau/runs/<ts>/logs/.",
+)
+def evolve_summarize(logs_dir: Optional[str]) -> None:
+    console = Console()
+    resolved = _resolve_logs_dir(logs_dir)
+    if resolved is None:
+        console.print("[yellow]No logs directory found.[/yellow]")
+        return
+    agent = EvolutionAgent(
+        logs_dir=resolved, prompts_dir=_default_prompts_dir()
+    )
+    summaries = agent.summarize()
+    console.print(Panel(Text(format_summary_table(summaries)),
+                        title=f"transcripts @ {resolved}", border_style="cyan"))
+
+
+@evolve.command(
+    name="propose",
+    help="Emit HarnessProposals based on transcript signals. Read-only — "
+    "proposals print to stdout; the prompts dir is never mutated.",
+)
+@click.option(
+    "--logs-dir",
+    "logs_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory of `<agent>.jsonl` transcripts.",
+)
+@click.option(
+    "--use-backend",
+    is_flag=True,
+    help="Also ask the configured backend to draft concrete prompt diffs for "
+    "prompt_edit proposals. Skipped when the resolved backend is the mock.",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(["auto", "claude", "codex", "mock"], case_sensitive=False),
+    default="auto",
+    help="Inference backend used when --use-backend is set.",
+)
+def evolve_propose(
+    logs_dir: Optional[str], use_backend: bool, backend: str
+) -> None:
+    console = Console()
+    resolved = _resolve_logs_dir(logs_dir)
+    if resolved is None:
+        console.print("[yellow]No logs directory found.[/yellow]")
+        return
+    backend_obj = select_backend(backend.lower()) if use_backend else None
+    agent = EvolutionAgent(
+        logs_dir=resolved,
+        prompts_dir=_default_prompts_dir(),
+        backend=backend_obj,
+    )
+    proposals = agent.propose()
+    console.print(Panel(Text(format_proposals(proposals)),
+                        title=f"proposals @ {resolved}", border_style="cyan"))
+
+
+@evolve.command(
+    name="regress",
+    help="Run the regression suite against the bundled fixtures using the "
+    "mock backend. Reports per-fixture pass/fail.",
+)
+@click.option(
+    "--fixtures",
+    "fixtures_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory of fixture JSON files. Defaults to the packaged "
+    "src/mau_cli/evolution_fixtures/.",
+)
+def evolve_regress(fixtures_dir: Optional[str]) -> None:
+    console = Console()
+    suite = RegressionSuite(
+        fixtures_dir=Path(fixtures_dir).resolve() if fixtures_dir else None
+    )
+    verdicts = suite.run()
+    console.print(Panel(Text(format_regression(verdicts)),
+                        title="regression results",
+                        border_style="green" if all(v.passed for v in verdicts) else "yellow"))
 
 
 if __name__ == "__main__":

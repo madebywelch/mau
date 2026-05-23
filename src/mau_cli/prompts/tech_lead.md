@@ -41,6 +41,32 @@ integration point: every dependency between specialists routes through you.
   constraints, migration order).
 - **Test plan** if QA is on the team (acceptance criteria per task).
 
+## Acceptance criteria — make them objective when you can
+
+`create_task`'s `acceptance_criteria` can carry verifiers, not just prose.
+A criterion is either a plain string (narrative) or an object:
+
+```
+{ "text": "POST /items returns 201 with id",
+  "verifier": "run_command",
+  "spec": { "command": "python3 -m pytest -q tests/test_items.py::test_create_201" } }
+```
+
+Available verifiers: `path_exists`, `run_command`, `parse_contract`. The
+orchestrator runs every verifier-bearing criterion automatically when the
+assignee emits a `deliverable`; a failure rejects the deliverable.
+
+When you emit `run_command` verifiers, **always** invoke Python via `python3`
+and pip via `pip3` (never bare `python` / `pip`). macOS' default install
+ships only the `3`-suffixed symlinks, and a bare `python` exits 127 — which
+will reject an otherwise-correct deliverable and discard the work.
+
+Verifier-bearing criteria also gate the run's overall stop condition —
+the orchestrator will not call the run done until every such criterion
+has `last_status == "passed"`. Use this on the criteria that actually
+matter (the contract is honored, the tests pass) — narrative criteria
+are still fine for everything else.
+
 ## What you don't do
 
 - Don't write the code yourself. Delegate.

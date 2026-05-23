@@ -7,7 +7,9 @@ tested without the full Rich/Click stack.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from time import time
@@ -60,6 +62,7 @@ MessageType = Literal[
     "directive",
 ]
 TaskStatus = Literal["pending", "in_progress", "blocked", "complete", "cancelled"]
+CriterionStatus = Literal["pending", "passed", "failed"]
 
 
 def _id(prefix: str) -> str:
@@ -68,6 +71,14 @@ def _id(prefix: str) -> str:
 
 def now() -> float:
     return time()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _doc_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -86,6 +97,86 @@ class Message:
 
 
 @dataclass
+class AcceptanceCriterion:
+    """A single acceptance criterion. `text` is the human-readable form; if
+    `verifier` is set, the orchestrator can run it against the workspace and
+    record the outcome in `last_*`."""
+
+    text: str = ""
+    verifier: Optional[str] = None  # name in verifiers.VERIFIERS
+    spec: Optional[dict[str, Any]] = None
+    last_status: CriterionStatus = "pending"
+    last_summary: Optional[str] = None
+    last_checked_turn: Optional[int] = None
+
+
+def _coerce_criteria(
+    raw: Optional[list[Any]],
+) -> list[AcceptanceCriterion]:
+    """Accept the agent-emitted shape, which is still a list of plain strings
+    for back-compat, OR a list of dicts, OR a list of AcceptanceCriterion."""
+    if not raw:
+        return []
+    out: list[AcceptanceCriterion] = []
+    for item in raw:
+        if isinstance(item, AcceptanceCriterion):
+            out.append(item)
+        elif isinstance(item, str):
+            out.append(AcceptanceCriterion(text=item))
+        elif isinstance(item, dict):
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            verifier = item.get("verifier")
+            spec = item.get("spec")
+            out.append(
+                AcceptanceCriterion(
+                    text=text,
+                    verifier=str(verifier) if verifier else None,
+                    spec=dict(spec) if isinstance(spec, dict) else None,
+                    last_status=item.get("last_status", "pending"),
+                    last_summary=item.get("last_summary"),
+                    last_checked_turn=item.get("last_checked_turn"),
+                )
+            )
+    return out
+
+
+@dataclass
+class DocVersion:
+    """One revision of a shared doc. Persisted in WorldState.shared_docs so
+    agents (and the transcript) can correlate who wrote what when, and
+    deliverables can record which exact version they were satisfied against."""
+
+    content: str = ""
+    hash: str = ""  # sha256 short hex (16 chars)
+    author: str = "system"
+    timestamp: str = field(default_factory=now_iso)
+    turn: int = 0
+
+
+@dataclass
+class Policy:
+    """A durable human-approval rule that every future agent prompt re-sees.
+
+    Promoted from one-shot `ask_user` answers (and CLI --policy flags) into
+    first-class WorldState so the team doesn't forget "never deploy without
+    a migration plan" the moment the question scrolls off the inbox. Persists
+    across turns and across `--resume`. Contrast with the orchestrator's
+    ephemeral `_turn_cap_announced` / `_completion_announced` /
+    `_rejected_this_turn` flags, which are intentionally not snapshotted —
+    those are per-tick guards, not durable governance state."""
+
+    id: str = field(default_factory=lambda: _id("pol"))
+    text: str = ""
+    scope: str = "global"  # "global" | "role:<role>" | "task:<task_id>"
+    source: str = "user"  # agent name or "user"
+    created_at: str = field(default_factory=now_iso)
+    created_turn: int = 0
+    active: bool = True
+
+
+@dataclass
 class Task:
     id: str = field(default_factory=lambda: _id("task"))
     title: str = ""
@@ -94,16 +185,27 @@ class Task:
     creator: str = ""
     status: TaskStatus = "pending"
     depends_on: list[str] = field(default_factory=list)  # task IDs
-    acceptance_criteria: list[str] = field(default_factory=list)
+    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
     deliverable_summary: Optional[str] = None
+    # doc name → hash of the version the agent was looking at when the
+    # deliverable landed. Lets later analysis see "did Task X close against
+    # a stale tech contract?".
+    satisfied_doc_versions: dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=now)
     updated_at: float = field(default_factory=now)
+
+    def __post_init__(self) -> None:
+        # Boundary coercion: agent-emitted JSON still uses plain strings.
+        self.acceptance_criteria = _coerce_criteria(self.acceptance_criteria)
 
     def is_unblocked(self, all_tasks: dict[str, "Task"]) -> bool:
         return all(
             all_tasks.get(dep) and all_tasks[dep].status == "complete"
             for dep in self.depends_on
         )
+
+    def criteria_with_verifier(self) -> list[AcceptanceCriterion]:
+        return [c for c in self.acceptance_criteria if c.verifier]
 
 
 @dataclass
@@ -140,6 +242,16 @@ class AgentState:
     files_touched: list[str] = field(default_factory=list)  # paths relative to workspace
     turns_taken: int = 0
     blocked_turns: int = 0  # for escalation
+    # Run-tracking for the consecutive-error backoff (Bug 5). Resets to 0
+    # on any successful turn. The orchestrator skips the agent for a few
+    # ticks after each consecutive error and escalates / gives up at
+    # configured thresholds so a flaky agent can't pin the run forever.
+    # `last_error_at_turn` stores the orchestrator's tick counter (NOT
+    # the per-agent turns_taken) so the backoff window ages even when no
+    # agent dispatched (otherwise a sole-failing agent would be skipped
+    # forever).
+    consecutive_errors: int = 0
+    last_error_at_turn: Optional[int] = None
     notes: list[str] = field(default_factory=list)  # internal scratchpad
     usage: TokenUsage = field(default_factory=TokenUsage)
     # Wall-clock when this agent's current turn started (None if idle/complete).
@@ -176,6 +288,11 @@ ActionType = Literal[
     "complete",
     "note",
     "ask_user",
+    "verify",
+    "check_criterion",
+    "write_doc",
+    "record_policy",
+    "retire_policy",
 ]
 
 
@@ -273,7 +390,13 @@ class WorldState:
     agents: dict[str, AgentState] = field(default_factory=dict)
     tasks: dict[str, Task] = field(default_factory=dict)
     messages: list[Message] = field(default_factory=list)  # full audit log
-    shared_docs: dict[str, str] = field(default_factory=dict)  # name → content
+    # name → version history, newest last. All writers must go through
+    # put_doc; readers wanting the latest go through get_doc.
+    shared_docs: dict[str, list[DocVersion]] = field(default_factory=dict)
+    # Durable human-approval rules. See Policy docstring; agent.py injects
+    # the matching subset into every prompt so rules survive across turns
+    # and across `--resume`.
+    policies: list[Policy] = field(default_factory=list)
     pending_user_questions: list[Message] = field(default_factory=list)
     log: list[str] = field(default_factory=list)  # human-readable event log
     started_at: float = field(default_factory=now)
@@ -287,6 +410,72 @@ class WorldState:
     # (matches AgentState.thinking_started_at semantics).
     discovery_status: Literal["none", "in_progress", "complete", "failed"] = "none"
     discovery_started_at: Optional[float] = None
+
+    def get_doc(self, name: str) -> Optional[str]:
+        versions = self.shared_docs.get(name)
+        return versions[-1].content if versions else None
+
+    def get_doc_version(self, name: str) -> Optional[DocVersion]:
+        versions = self.shared_docs.get(name)
+        return versions[-1] if versions else None
+
+    def active_policies(
+        self, scope_filter: Optional[str] = None
+    ) -> list["Policy"]:
+        """Return active policies visible under `scope_filter`. `global` is
+        always returned. When `scope_filter` is None, only globals match.
+
+        For `role:<role>` filters, a policy with scope `role:<role>` matches.
+        For `task:<task_id>` filters, a policy with scope `task:<task_id>`
+        matches. Exact match on the rest; no wildcards. The ordering matches
+        insertion order so prompts render deterministically across reruns."""
+        out: list[Policy] = []
+        for p in self.policies:
+            if not p.active:
+                continue
+            if p.scope == "global":
+                out.append(p)
+                continue
+            if scope_filter is not None and p.scope == scope_filter:
+                out.append(p)
+        return out
+
+    def add_policy(
+        self, text: str, scope: str, source: str, turn: int
+    ) -> "Policy":
+        """Append and return a new Policy. If an active policy with the same
+        (text, scope) already exists, return the existing one — dedupes the
+        common case of the user passing --policy on resume."""
+        text = text.strip()
+        scope = (scope or "global").strip() or "global"
+        for existing in self.policies:
+            if existing.active and existing.text == text and existing.scope == scope:
+                return existing
+        policy = Policy(
+            text=text,
+            scope=scope,
+            source=source or "user",
+            created_turn=turn,
+        )
+        self.policies.append(policy)
+        return policy
+
+    def put_doc(
+        self, name: str, content: str, author: str, turn: int
+    ) -> DocVersion:
+        """Append a new DocVersion. If the latest version already has the
+        same content hash, return the existing version unchanged so we don't
+        pile up duplicates from idempotent re-publishes (e.g. codebase map
+        refresh that produced an identical scan)."""
+        h = _doc_hash(content)
+        versions = self.shared_docs.setdefault(name, [])
+        if versions and versions[-1].hash == h:
+            return versions[-1]
+        version = DocVersion(
+            content=content, hash=h, author=author, turn=turn
+        )
+        versions.append(version)
+        return version
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -303,7 +492,11 @@ class WorldState:
             "agents": {n: asdict(a) for n, a in self.agents.items()},
             "tasks": {tid: asdict(t) for tid, t in self.tasks.items()},
             "messages": [asdict(m) for m in self.messages],
-            "shared_docs": dict(self.shared_docs),
+            "shared_docs": {
+                name: [asdict(v) for v in versions]
+                for name, versions in self.shared_docs.items()
+            },
+            "policies": [asdict(p) for p in self.policies],
             "log": list(self.log),
             "final_summary": self.final_summary,
             "usage": asdict(self.usage),

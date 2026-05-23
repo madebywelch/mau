@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 from importlib import resources
+from pathlib import Path
+from typing import Optional
 
 from mau_cli.inference import InferenceBackend, InferenceResult
 from mau_cli.schemas import (
@@ -23,6 +25,14 @@ from mau_cli.schemas import (
     TokenUsage,
     WorldState,
 )
+
+
+# Per-doc cap in characters when injecting shared docs into a prompt.
+# Set generously (~60k chars ≈ ~15k tokens) so agents see the full text the
+# overwhelming majority of the time, while still bounding catastrophic-size
+# blowups. When a doc exceeds this, the prompt prepends a clear marker so
+# the agent knows it's looking at a truncated copy.
+SHARED_DOC_HARD_CAP = 60_000
 
 
 def load_role_prompt(role: Role) -> str:
@@ -38,6 +48,15 @@ class Agent:
         self.backend = backend
         self.system_prompt = load_role_prompt(state.role)
         self.is_code_gen = state.role in CODE_GEN_ROLES
+        # Transient, set by run_turn so the orchestrator can persist the
+        # prompt+response pair without changing AgentTurn's shape.
+        self.last_prompt: str = ""
+        self.last_result: InferenceResult | None = None
+        # name → hash of the doc version this agent saw in its last prompt.
+        # Snapshotted onto Tasks when this agent's deliverable lands, so
+        # later analysis can see which version of each contract the
+        # deliverable was satisfied against.
+        self.last_doc_versions: dict[str, str] = {}
 
     # ---- prompt construction --------------------------------------------
 
@@ -84,16 +103,63 @@ class Agent:
         lines.append("")
 
         # Shared docs are *the* coordination artifact. Specialists read them
-        # to learn the contract; planners write them to publish it.
+        # to learn the contract; planners write them to publish it. We inject
+        # the full latest content plus the version hash so every agent sees
+        # the same mental copy and stale-version blunders are detectable.
+        self.last_doc_versions = {}
         if world.shared_docs:
             lines.append("SHARED_DOCS:")
-            for name, content in world.shared_docs.items():
-                lines.append(f"  --- {name} ---")
-                # Truncate generously; specialists need full content.
-                if len(content) > 4000:
-                    lines.append(content[:4000] + "\n…[truncated]")
+            for name in world.shared_docs:
+                version = world.get_doc_version(name)
+                if version is None:
+                    continue
+                self.last_doc_versions[name] = version.hash
+                header = (
+                    f"  --- {name} "
+                    f"[version={version.hash} author={version.author} "
+                    f"turn={version.turn}] ---"
+                )
+                lines.append(header)
+                content = version.content
+                if len(content) > SHARED_DOC_HARD_CAP:
+                    lines.append(
+                        f"  [WARNING: doc exceeds {SHARED_DOC_HARD_CAP} chars and "
+                        f"was truncated; version hash above identifies the full "
+                        f"copy on disk at shared/{name}]"
+                    )
+                    lines.append(content[:SHARED_DOC_HARD_CAP] + "\n…[truncated]")
                 else:
                     lines.append(content)
+            lines.append("")
+
+        # Durable policies — human-approval rules captured via record_policy
+        # (or the --policy CLI flag). Re-rendered every turn so rules survive
+        # across turns and resumes. Matched by scope: global always shows;
+        # role:<role> shows when this agent's role matches; task:<id> shows
+        # when this agent has that task open.
+        my_open_tasks = {
+            tid for tid in s.assigned_tasks
+            if tid in world.tasks and world.tasks[tid].status != "complete"
+        }
+        scope_filters = [f"role:{s.role.value}"] + [f"task:{tid}" for tid in my_open_tasks]
+        matching: list = list(world.active_policies())  # globals
+        seen_ids = {p.id for p in matching}
+        for scope in scope_filters:
+            for p in world.active_policies(scope):
+                if p.id not in seen_ids:
+                    matching.append(p)
+                    seen_ids.add(p.id)
+        if matching:
+            lines.append("### Active policies")
+            lines.append(
+                "  (Durable rules the user — or a teammate — recorded. They "
+                "OVERRIDE your default judgment. If a policy conflicts with "
+                "a task, flag it via send_message rather than violate it.)"
+            )
+            for p in matching:
+                lines.append(
+                    f"  - [{p.id}] (scope={p.scope}, source={p.source}) {p.text}"
+                )
             lines.append("")
 
         my_tasks = [world.tasks[tid] for tid in s.assigned_tasks if tid in world.tasks]
@@ -107,7 +173,12 @@ class Agent:
                         lines.append(f"      {d_line}")
                 if t.acceptance_criteria:
                     for ac in t.acceptance_criteria:
-                        lines.append(f"      ✓ {ac}")
+                        prefix = f"      ✓ {ac.text}"
+                        if ac.verifier:
+                            prefix += (
+                                f" [verifier={ac.verifier}, status={ac.last_status}]"
+                            )
+                        lines.append(prefix)
             lines.append("")
 
         if s.inbox:
@@ -160,14 +231,19 @@ class Agent:
 
     # ---- turn dispatch --------------------------------------------------
 
-    def run_turn(self, world: WorldState) -> AgentTurn:
+    def run_turn(
+        self, world: WorldState, cwd: Optional[Path] = None
+    ) -> AgentTurn:
         prompt = self.build_user_prompt(world)
         if self.is_code_gen and world.workspace is not None:
-            result = self._run_agentic(world, prompt)
+            result = self._run_agentic(world, prompt, cwd=cwd)
         else:
             result = self.backend.call_plan(self.system_prompt, prompt)
             self.state.usage.add(result.usage)
             world.usage.add(result.usage)
+
+        self.last_prompt = prompt
+        self.last_result = result
 
         turn = self._result_to_turn(result)
         # Track files touched on the agent.
@@ -179,13 +255,23 @@ class Agent:
         self.state.turns_taken += 1
         return turn
 
-    def _run_agentic(self, world: WorldState, prompt: str) -> InferenceResult:
+    def _run_agentic(
+        self,
+        world: WorldState,
+        prompt: str,
+        cwd: Optional[Path] = None,
+    ) -> InferenceResult:
+        """Run the agentic backend in the per-agent worktree when `cwd` is
+        supplied (the orchestrator owns acquire/release). Falls back to the
+        shared workspace dir when no isolation context is provided so
+        backend tests still work outside the orchestrator."""
         ws = world.workspace
         assert ws is not None
+        workspace_dir = str(cwd) if cwd is not None else ws.code_dir
         result = self.backend.call_agentic(
             system_prompt=self.system_prompt,
             user_prompt=prompt,
-            workspace_dir=ws.code_dir,
+            workspace_dir=workspace_dir,
             extra_dirs=[ws.shared_dir],
         )
         self.state.usage.add(result.usage)
@@ -219,10 +305,22 @@ class Agent:
                 ],
             )
 
-        return AgentTurn(
-            thoughts=str(deliverable.get("summary", ""))[:500],
-            status="complete",
-            actions=[
+        actions: list[dict[str, object]] = []
+        # Optional: specialists can request verifiers as part of their
+        # deliverable. They run BEFORE the deliverable so failures can
+        # mark the turn rejected and short-circuit "complete".
+        for v in deliverable.get("verify") or []:
+            if not isinstance(v, dict):
+                continue
+            actions.append(
+                {
+                    "type": "verify",
+                    "verifier": v.get("verifier", ""),
+                    "spec": v.get("spec") or {},
+                }
+            )
+        actions.extend(
+            [
                 {
                     "type": "deliverable",
                     "title": deliverable.get("title", "Deliverable"),
@@ -230,5 +328,10 @@ class Agent:
                     "files_touched": result.files_touched,
                 },
                 {"type": "complete", "summary": deliverable.get("summary", "")},
-            ],
+            ]
+        )
+        return AgentTurn(
+            thoughts=str(deliverable.get("summary", ""))[:500],
+            status="complete",
+            actions=actions,
         )

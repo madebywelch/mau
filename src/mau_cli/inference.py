@@ -19,13 +19,85 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import time as _time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from mau_cli.schemas import TokenUsage
+
+
+# Two retries with short backoff. The error pattern we target (claude returns
+# exit=1 with a structured-but-empty envelope) is transient; in practice a
+# 1-3s gap is enough for whatever rate-limit / concurrent-session conflict
+# triggered it to clear.
+CLAUDE_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0)
+
+# Hard cap on a single claude/codex invocation. `subprocess.run(timeout=...)`
+# only kills the immediate child; MCP-server grandchildren keep pipes open and
+# the call hangs indefinitely. We run in a new process group and kill the
+# whole tree on timeout — see `_run_with_group_kill`.
+CLAUDE_INVOKE_TIMEOUT_SECONDS: int = 1800
+
+
+def _run_with_group_kill(
+    cmd: list[str],
+    *,
+    cwd: Optional[str],
+    env: Optional[dict[str, str]],
+    timeout: int,
+) -> tuple[subprocess.Popen[str], str, str]:
+    """Run `cmd` in its own process group; SIGTERM/SIGKILL the group on timeout.
+
+    Returns (proc, stdout, stderr). Raises RuntimeError on timeout so the
+    orchestrator's existing exception path surfaces it as `agent_error`."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        cwd=cwd,
+        env=env,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc, stdout, stderr
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except Exception:
+            stdout, stderr = "", ""
+        raise RuntimeError(
+            f"claude CLI timed out after {timeout}s "
+            f"(stdout_tail={(stdout or '')[-200:]!r})"
+        )
+
+# Heuristic markers in codex stderr that suggest a retryable issue rather than
+# a malformed prompt. Matched case-insensitively.
+_CODEX_TRANSIENT_MARKERS: tuple[str, ...] = (
+    "timeout",
+    "timed out",
+    "rate limit",
+    "connection",
+    "temporarily",
+)
 
 
 # JSON-extraction. Models occasionally wrap JSON in fences or add prose.
@@ -127,9 +199,19 @@ class ClaudeCLIBackend(InferenceBackend):
 
     name = "claude"
 
-    def __init__(self, binary: str = "claude", model: Optional[str] = None):
+    def __init__(
+        self,
+        binary: str = "claude",
+        model: Optional[str] = None,
+        on_retry: Optional[Callable[[dict[str, Any]], None]] = None,
+    ):
         self.binary = binary
         self.model = model
+        # Optional sink for "this invocation transiently failed and we retried"
+        # signals. Orchestrator wires this to an `inference_retried` event so
+        # transcripts capture the flake. Best-effort: callback errors are
+        # swallowed so a buggy observer can't kill an otherwise-healthy run.
+        self.on_retry = on_retry
 
     def available(self) -> bool:
         return shutil.which(self.binary) is not None
@@ -143,6 +225,9 @@ class ClaudeCLIBackend(InferenceBackend):
             "--output-format", "json",
             "--append-system-prompt", system_prompt,
             "--disallowedTools", _AGENTIC_TOOLS,  # plan mode: no tools
+            # Avoid session-file lock contention when many planners run in
+            # parallel; plan mode is a one-shot and we never resume it.
+            "--no-session-persistence",
         ]
         if self.model:
             cmd += ["--model", self.model]
@@ -178,6 +263,9 @@ class ClaudeCLIBackend(InferenceBackend):
             "--permission-mode", "bypassPermissions",
             "--append-system-prompt", system_prompt,
             "--allowedTools", _AGENTIC_TOOLS,
+            # Avoid session-file lock contention when many agents run in
+            # parallel; specialists never resume sessions cross-turn.
+            "--no-session-persistence",
         ]
         for d in (extra_dirs or []):
             cmd += ["--add-dir", d]
@@ -207,30 +295,118 @@ class ClaudeCLIBackend(InferenceBackend):
     def _invoke(
         self, cmd: list[str], cwd: Optional[str] = None
     ) -> tuple[dict[str, Any], str, int]:
-        start = _time.monotonic()
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,  # don't block on stdin
-            timeout=900,
-            env={**os.environ, "CLAUDE_CODE_DISABLE_TELEMETRY": "1"},
-        )
-        duration_ms = int((_time.monotonic() - start) * 1000)
-
-        if proc.returncode != 0:
-            stderr_tail = proc.stderr.strip()[-800:]
-            stdout_tail = proc.stdout.strip()[-300:]
-            raise RuntimeError(
-                f"claude CLI exited {proc.returncode}\nstderr: {stderr_tail}\nstdout: {stdout_tail}"
+        # Retry pattern: one initial attempt + len(CLAUDE_RETRY_BACKOFF_SECONDS)
+        # retries. We only retry when claude returns a structured envelope that
+        # indicates no actual model output happened (transient backend flake).
+        # A real failure — invalid prompt, unknown flag, anything where stdout
+        # isn't a parseable envelope or where the envelope contains substantive
+        # content — raises on the first attempt. Timeouts (from group-kill) are
+        # also non-retryable: a 30-min wedge isn't going to clear in 1-3s.
+        last_err: Optional[str] = None
+        attempts = [0.0, *CLAUDE_RETRY_BACKOFF_SECONDS]
+        for attempt, delay in enumerate(attempts):
+            if delay:
+                _time.sleep(delay)
+            start = _time.monotonic()
+            proc, stdout, stderr = _run_with_group_kill(
+                cmd,
+                cwd=cwd,
+                env={**os.environ, "CLAUDE_CODE_DISABLE_TELEMETRY": "1"},
+                timeout=CLAUDE_INVOKE_TIMEOUT_SECONDS,
             )
+            duration_ms = int((_time.monotonic() - start) * 1000)
 
-        try:
-            envelope = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            envelope = {"result": proc.stdout}
-        return envelope, proc.stdout, duration_ms
+            if proc.returncode == 0:
+                try:
+                    envelope = json.loads(stdout)
+                except json.JSONDecodeError:
+                    envelope = {"result": stdout}
+                return envelope, stdout, duration_ms
+
+            envelope: Optional[dict[str, Any]] = None
+            try:
+                envelope = json.loads(stdout)
+            except json.JSONDecodeError:
+                envelope = None
+
+            if envelope is not None and self._envelope_is_transient(envelope):
+                last_err = self._format_error(proc.returncode, stdout, stderr, envelope, attempt)
+                self._notify_retry(attempt, last_err, envelope)
+                continue
+
+            raise RuntimeError(self._format_error(proc.returncode, stdout, stderr, envelope, attempt))
+
+        raise RuntimeError(f"claude CLI exhausted retries: {last_err}")
+
+    def _notify_retry(
+        self, attempt: int, err: str, envelope: Optional[dict[str, Any]]
+    ) -> None:
+        payload = {
+            "backend": self.name,
+            "attempt": attempt,
+            "error": err,
+            "envelope_keys": sorted(envelope.keys()) if envelope else [],
+        }
+        if self.on_retry is not None:
+            try:
+                self.on_retry(payload)
+            except Exception:
+                pass
+        # Always leave a breadcrumb in stderr so a real-backend run shows the
+        # flake even when the caller didn't wire `on_retry`.
+        print(
+            f"[claude-retry attempt={attempt}] {err}",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _envelope_is_transient(envelope: dict[str, Any]) -> bool:
+        """Heuristic: response parsed but contains no actual model output.
+
+        Pattern observed in the wild — exit code 1 with a structured envelope
+        whose `iterations` and `modelUsage` are empty, or whose error subtype
+        explicitly flags an in-execution failure. These reliably clear on
+        retry; real prompt errors don't.
+
+        `error_max_turns` is deliberately NOT retryable: when the cap comes
+        from our own argv it's deterministic, and when it comes from claude's
+        default it means the prompt itself drives unbounded iteration —
+        retrying just burns budget."""
+        subtype = envelope.get("subtype")
+        if envelope.get("is_error") and subtype == "error_during_execution":
+            return True
+        if envelope.get("iterations") == [] and envelope.get("modelUsage") == {}:
+            return True
+        return False
+
+    @staticmethod
+    def _format_error(
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        envelope: Optional[dict[str, Any]],
+        attempt: int,
+    ) -> str:
+        stderr_tail = (stderr or "").strip()[-400:]
+        if envelope is not None:
+            keys = (
+                "subtype",
+                "is_error",
+                "result",
+                "terminal_reason",
+                "api_error_status",
+                "session_id",
+            )
+            snapshot = {k: envelope.get(k) for k in keys if k in envelope}
+            return (
+                f"claude CLI exit={returncode} (attempt={attempt}) "
+                f"envelope={snapshot} stderr={stderr_tail!r}"
+            )
+        stdout_tail = (stdout or "").strip()[-300:]
+        return (
+            f"claude CLI exit={returncode} (attempt={attempt}) "
+            f"stderr={stderr_tail!r} stdout_tail={stdout_tail!r}"
+        )
 
 
 def _usage_from_envelope(envelope: dict[str, Any]) -> TokenUsage:
@@ -251,8 +427,13 @@ class CodexCLIBackend(InferenceBackend):
 
     name = "codex"
 
-    def __init__(self, binary: str = "codex"):
+    def __init__(
+        self,
+        binary: str = "codex",
+        on_retry: Optional[Callable[[dict[str, Any]], None]] = None,
+    ):
         self.binary = binary
+        self.on_retry = on_retry
 
     def available(self) -> bool:
         return shutil.which(self.binary) is not None
@@ -276,31 +457,65 @@ class CodexCLIBackend(InferenceBackend):
         combined = f"{system_prompt}\n\n---\n\n{user_prompt}"
         cmd = [self.binary, "exec", "--quiet", combined]
 
-        start = _time.monotonic()
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=cwd, timeout=900
-        )
-        duration_ms = int((_time.monotonic() - start) * 1000)
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"codex CLI exited {proc.returncode}: {proc.stderr.strip()[:300]}"
+        # Codex doesn't emit a structured envelope, so we use a coarser
+        # signal: retry once on a non-zero exit when stderr looks like a
+        # transient network / rate-limit error. A real failure (malformed
+        # prompt, syntax error) surfaces unchanged.
+        last_err: Optional[str] = None
+        for attempt in (0, 1):
+            start = _time.monotonic()
+            proc, stdout, stderr = _run_with_group_kill(
+                cmd,
+                cwd=cwd,
+                env=None,
+                timeout=CLAUDE_INVOKE_TIMEOUT_SECONDS,
             )
+            duration_ms = int((_time.monotonic() - start) * 1000)
 
-        text = proc.stdout
-        if plan:
-            parsed = extract_json(text)
-            files = []
-        else:
-            parsed = extract_deliverable(text) or {}
-            files = list(parsed.get("files_touched", []) or [])
-        return InferenceResult(
-            raw_text=text,
-            parsed=parsed,
-            backend=self.name,
-            duration_ms=duration_ms,
-            usage=TokenUsage(calls=1),
-            files_touched=files,
+            if proc.returncode == 0:
+                text = stdout
+                if plan:
+                    parsed = extract_json(text)
+                    files = []
+                else:
+                    parsed = extract_deliverable(text) or {}
+                    files = list(parsed.get("files_touched", []) or [])
+                return InferenceResult(
+                    raw_text=text,
+                    parsed=parsed,
+                    backend=self.name,
+                    duration_ms=duration_ms,
+                    usage=TokenUsage(calls=1),
+                    files_touched=files,
+                )
+
+            last_err = (
+                f"codex CLI exit={proc.returncode} (attempt={attempt}): "
+                f"{(stderr or '').strip()[:300]}"
+            )
+            if attempt == 0 and self._stderr_looks_transient(stderr or ""):
+                self._notify_retry(attempt, last_err)
+                _time.sleep(1.0)
+                continue
+            raise RuntimeError(last_err)
+
+        raise RuntimeError(f"codex CLI exhausted retries: {last_err}")
+
+    @staticmethod
+    def _stderr_looks_transient(stderr: str) -> bool:
+        low = stderr.lower()
+        return any(marker in low for marker in _CODEX_TRANSIENT_MARKERS)
+
+    def _notify_retry(self, attempt: int, err: str) -> None:
+        payload = {"backend": self.name, "attempt": attempt, "error": err}
+        if self.on_retry is not None:
+            try:
+                self.on_retry(payload)
+            except Exception:
+                pass
+        print(
+            f"[codex-retry attempt={attempt}] {err}",
+            file=sys.stderr,
         )
 
 
