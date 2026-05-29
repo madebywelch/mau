@@ -27,6 +27,7 @@ production sandbox."
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -350,26 +351,38 @@ def _safe_slug(agent_name: str) -> str:
     return cleaned[:64]
 
 
+# Directories never worth walking for the merge-baseline mtime: VCS internals,
+# our own scratch dirs, and large generated/dependency trees. Pruning these
+# keeps the per-acquire/-release walk proportional to source-file count rather
+# than to the size of node_modules.
+_MTIME_SKIP_DIRS = frozenset(
+    {
+        ".git", ".mau", ".mau-worktrees", "node_modules", ".venv", "venv",
+        "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
+        ".next", ".nuxt", "target", ".gradle", ".idea", ".tox", "vendor",
+    }
+)
+
+
 def _newest_mtime(path: Path) -> float:
-    """Highest mtime under `path` excluding `.git/` and `.mau-worktrees/`.
-    Used as the merge baseline. If we can't walk the tree, return 0.0 so
-    every existing file looks "older than baseline" (i.e. no false-positive
-    overwrote events)."""
+    """Highest mtime under `path`, skipping VCS internals, our scratch dirs,
+    and heavy generated/dependency trees (see `_MTIME_SKIP_DIRS`). Used as the
+    merge baseline. If we can't walk the tree, return 0.0 so every existing
+    file looks "older than baseline" (i.e. no false-positive overwrote events).
+
+    The pruning matters: this runs on every acquire and every release, so a
+    naive walk would stat every file in `node_modules` per agent per turn."""
     newest = 0.0
     try:
-        for p in path.rglob("*"):
-            try:
-                parts = p.relative_to(path).parts
-            except ValueError:
-                continue
-            if parts and parts[0] in {".git", ".mau-worktrees", ".mau"}:
-                continue
-            try:
-                m = p.stat().st_mtime
-                if m > newest:
-                    newest = m
-            except OSError:
-                continue
+        for root, dirnames, filenames in os.walk(path):
+            dirnames[:] = [d for d in dirnames if d not in _MTIME_SKIP_DIRS]
+            for fn in filenames:
+                try:
+                    m = (Path(root) / fn).stat().st_mtime
+                    if m > newest:
+                        newest = m
+                except OSError:
+                    continue
     except OSError:
         return 0.0
     return newest
@@ -383,8 +396,16 @@ def make_isolation_backend(
     emit: Optional[EventEmitter] = None,
 ) -> IsolationBackend:
     """Factory. Selects the worktree backend when:
-      - `mode` is `"worktree"`, OR
-      - `mode` is `"auto"` and `code_dir` is inside a git repo
+      - `mode` is `"worktree"` (explicit opt-in), OR
+      - `mode` is `"auto"`, the run is *brownfield*, and the repo is clean.
+
+    `auto` in a *greenfield* run deliberately resolves to **shared**. The
+    worktree backend would be built off the host repo's HEAD (greenfield
+    workspaces commonly live nested under a repo the user ran inside), so
+    agents would start every turn from a pristine checkout of unrelated source
+    and never see peers' merged work — integration verifiers (`pytest`, build
+    commands) can't pass against a partial tree. Shared gives correct
+    cumulative semantics. Force `--isolation worktree` to override.
 
     Brownfield safety: if the repo has uncommitted changes we *refuse* the
     worktree backend and fall back to shared, emitting `worktree_disabled`
@@ -408,6 +429,11 @@ def make_isolation_backend(
             )
         return SharedWorkspaceBackend(code_dir)
 
+    if mode == "auto" and not brownfield:
+        # Greenfield default: shared (see docstring — avoids worktrees off the
+        # host repo's HEAD and the broken integration semantics that follow).
+        return SharedWorkspaceBackend(code_dir)
+
     toplevel = _git_toplevel(code_dir) or code_dir
 
     if brownfield and _has_uncommitted_changes(toplevel):
@@ -421,10 +447,29 @@ def make_isolation_backend(
         )
         return SharedWorkspaceBackend(code_dir)
 
-    # Greenfield: `git init` may live at the parent of `code_dir` (the user
-    # initialised the run root, with `workspace/` nested under it). The worktree
-    # backend has to run `git worktree add` against the toplevel but merge
-    # back into `code_dir` so files land where every other component expects.
+    # Worktree selected (explicit, or brownfield-auto with a clean repo). Make
+    # its limitations observable up front: each per-agent worktree is reset to
+    # HEAD every turn and excludes git-ignored files (node_modules, .venv,
+    # .env), and verifiers run against that pre-merge partial tree — so a
+    # cross-agent integration check won't see peers' merged work or ignored
+    # deps. `--isolation shared` is the escape hatch.
+    emit(
+        "worktree_isolation_caveat",
+        {
+            "git_root": str(toplevel),
+            "merge_dest": str(code_dir),
+            "note": (
+                "per-agent worktrees reset to HEAD each turn and exclude "
+                "git-ignored files; verifiers run against a partial tree. Use "
+                "--isolation shared if a verifier needs the merged workspace "
+                "or ignored deps."
+            ),
+        },
+    )
+    # Greenfield (explicit worktree): `git init` may live at the parent of
+    # `code_dir` (run root with `workspace/` nested under it). The worktree
+    # backend runs `git worktree add` against the toplevel but merges back into
+    # `code_dir` so files land where every other component expects.
     return GitWorktreeBackend(
         git_root=toplevel,
         merge_dest=code_dir,

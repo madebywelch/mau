@@ -12,6 +12,7 @@ from the final assistant text.
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import Optional
@@ -35,7 +36,11 @@ from mau_cli.schemas import (
 SHARED_DOC_HARD_CAP = 60_000
 
 
+@lru_cache(maxsize=None)
 def load_role_prompt(role: Role) -> str:
+    # Prompt files are immutable for the life of the process, so cache the
+    # composed text per role — otherwise every Agent construction (including
+    # re-hydrating N agents on --resume) re-reads protocol.md + <role>.md.
     pkg = "mau_cli.prompts"
     protocol = resources.files(pkg).joinpath("_protocol.md").read_text(encoding="utf-8")
     role_text = resources.files(pkg).joinpath(f"{role.value}.md").read_text(encoding="utf-8")
@@ -57,6 +62,11 @@ class Agent:
         # later analysis can see which version of each contract the
         # deliverable was satisfied against.
         self.last_doc_versions: dict[str, str] = {}
+        # Message IDs rendered into the most recent prompt. `finalize_turn`
+        # consumes exactly these from the inbox, so a message delivered while
+        # the turn was in flight (after the prompt was built) survives to the
+        # next turn instead of being silently cleared.
+        self._consumed_msg_ids: set[str] = set()
 
     # ---- prompt construction --------------------------------------------
 
@@ -181,6 +191,10 @@ class Agent:
                         lines.append(prefix)
             lines.append("")
 
+        # Record exactly which messages this prompt shows; finalize_turn
+        # consumes these (and only these) so concurrently-delivered messages
+        # aren't dropped.
+        self._consumed_msg_ids = {m.id for m in s.inbox}
         if s.inbox:
             lines.append("INBOX (unread, oldest first):")
             for msg in s.inbox:
@@ -234,49 +248,82 @@ class Agent:
     def run_turn(
         self, world: WorldState, cwd: Optional[Path] = None
     ) -> AgentTurn:
+        """Convenience wrapper: build → infer → finalize inline. Used by
+        direct callers (tests, scripts). The orchestrator drives these three
+        phases separately so the blocking `infer` runs off the main thread
+        while prompt construction and state mutation stay single-threaded."""
         prompt = self.build_user_prompt(world)
-        if self.is_code_gen and world.workspace is not None:
-            result = self._run_agentic(world, prompt, cwd=cwd)
-        else:
-            result = self.backend.call_plan(self.system_prompt, prompt)
-            self.state.usage.add(result.usage)
-            world.usage.add(result.usage)
+        workspace_dir, extra_dirs = self.infer_dirs(world, cwd)
+        result = self.infer(
+            prompt,
+            workspace_dir=workspace_dir,
+            extra_dirs=extra_dirs,
+            max_budget_usd=None,
+        )
+        return self.finalize_turn(world, prompt, result)
 
+    def infer_dirs(
+        self, world: WorldState, cwd: Optional[Path] = None
+    ) -> tuple[Optional[str], Optional[list[str]]]:
+        """Resolve (workspace_dir, extra_dirs) on the caller's thread. Planning
+        roles get (None, None) — no tools, no cwd. Specialists get the per-agent
+        worktree (or the shared workspace when no isolation context is given,
+        e.g. backend tests) plus the shared-docs dir."""
+        ws = world.workspace
+        if self.is_code_gen and ws is not None:
+            workspace_dir = str(cwd) if cwd is not None else ws.code_dir
+            return workspace_dir, [ws.shared_dir]
+        return None, None
+
+    def infer(
+        self,
+        prompt: str,
+        *,
+        workspace_dir: Optional[str],
+        extra_dirs: Optional[list[str]],
+        max_budget_usd: Optional[float] = None,
+    ) -> InferenceResult:
+        """Pure inference — safe to run off the main thread. Touches no
+        WorldState or agent state; it only shells out to the backend and
+        returns the raw result. Planning roles (workspace_dir is None) use
+        `call_plan`; specialists use the tool-enabled agentic path, capped at
+        `max_budget_usd` so a single runaway turn can't blow the run budget."""
+        if self.is_code_gen and workspace_dir is not None:
+            return self.backend.call_agentic(
+                system_prompt=self.system_prompt,
+                user_prompt=prompt,
+                workspace_dir=workspace_dir,
+                extra_dirs=extra_dirs,
+                max_budget_usd=max_budget_usd,
+            )
+        return self.backend.call_plan(self.system_prompt, prompt)
+
+    def finalize_turn(
+        self, world: WorldState, prompt: str, result: InferenceResult
+    ) -> AgentTurn:
+        """Main-thread bookkeeping after `infer` returns: record the tape,
+        accumulate usage (single-writer, so no race on world.usage), fold in
+        files touched, consume exactly the inbox messages shown in `prompt`,
+        and advance the turn counter."""
         self.last_prompt = prompt
         self.last_result = result
+        self.state.usage.add(result.usage)
+        world.usage.add(result.usage)
 
         turn = self._result_to_turn(result)
-        # Track files touched on the agent.
         for f in result.files_touched:
             if f not in self.state.files_touched:
                 self.state.files_touched.append(f)
 
-        self.state.inbox.clear()
+        # Consume only the messages this turn actually saw; anything delivered
+        # mid-flight stays queued for next turn.
+        if self._consumed_msg_ids:
+            self.state.inbox = [
+                m for m in self.state.inbox if m.id not in self._consumed_msg_ids
+            ]
+            self._consumed_msg_ids = set()
         self.state.turns_taken += 1
         return turn
-
-    def _run_agentic(
-        self,
-        world: WorldState,
-        prompt: str,
-        cwd: Optional[Path] = None,
-    ) -> InferenceResult:
-        """Run the agentic backend in the per-agent worktree when `cwd` is
-        supplied (the orchestrator owns acquire/release). Falls back to the
-        shared workspace dir when no isolation context is provided so
-        backend tests still work outside the orchestrator."""
-        ws = world.workspace
-        assert ws is not None
-        workspace_dir = str(cwd) if cwd is not None else ws.code_dir
-        result = self.backend.call_agentic(
-            system_prompt=self.system_prompt,
-            user_prompt=prompt,
-            workspace_dir=workspace_dir,
-            extra_dirs=[ws.shared_dir],
-        )
-        self.state.usage.add(result.usage)
-        world.usage.add(result.usage)
-        return result
 
     # ---- result interpretation ------------------------------------------
 

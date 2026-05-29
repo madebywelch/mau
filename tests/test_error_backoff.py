@@ -85,10 +85,14 @@ def test_escalation_blocker_routed_to_supervisor(tmp_workspace):
     assert esc["consecutive_errors"] == ERROR_ESCALATE_AT
     assert esc["supervisor"] == "em-1"
 
-    # A blocker message should land in em-1's history or inbox.
+    # A blocker message should land in em-1's inbox (or, once consumed, the
+    # canonical audit log world.messages — per-agent history was removed as it
+    # only duplicated that log).
     em = orch.agents.get("em-1")
     assert em is not None
-    all_msgs = list(em.state.inbox) + list(em.state.history)
+    all_msgs = list(em.state.inbox) + [
+        m for m in orch.world.messages if m.to_agent == "em-1"
+    ]
     blockers = [
         m for m in all_msgs
         if m.msg_type == "blocker" and "tl-1" in m.subject

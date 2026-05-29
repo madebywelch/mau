@@ -7,9 +7,13 @@ from pathlib import Path
 
 import pytest
 
+import os
+import time
+
 from mau_cli.isolation import (
     GitWorktreeBackend,
     SharedWorkspaceBackend,
+    _newest_mtime,
     make_isolation_backend,
 )
 
@@ -29,6 +33,33 @@ def test_factory_git_mode_worktree(tmp_git_workspace):
     )
     assert isinstance(backend, GitWorktreeBackend)
     backend.cleanup()
+
+
+def test_factory_auto_greenfield_in_git_repo_is_shared(tmp_git_workspace):
+    """auto + greenfield, even inside a git repo, defaults to shared: building
+    worktrees off the host repo's HEAD would start agents from unrelated source
+    and break integration verification. Worktree stays an explicit opt-in."""
+    backend = make_isolation_backend(
+        Path(tmp_git_workspace.code_dir), mode="auto", brownfield=False
+    )
+    assert isinstance(backend, SharedWorkspaceBackend)
+
+
+def test_factory_auto_brownfield_clean_repo_is_worktree_with_caveat(tmp_git_workspace):
+    """auto + brownfield + clean repo still selects worktree, and announces its
+    limitations via a one-time `worktree_isolation_caveat` event."""
+    events: list[tuple[str, dict]] = []
+    backend = make_isolation_backend(
+        Path(tmp_git_workspace.code_dir),
+        mode="auto",
+        brownfield=True,
+        emit=lambda k, p: events.append((k, p)),
+    )
+    try:
+        assert isinstance(backend, GitWorktreeBackend)
+        assert any(k == "worktree_isolation_caveat" for k, _ in events)
+    finally:
+        backend.cleanup()
 
 
 # ---- GitWorktreeBackend behaviour ------------------------------------------
@@ -194,3 +225,27 @@ def test_make_isolation_backend_greenfield_passes_merge_dest(tmp_path):
         assert not (root / "via_factory.py").exists()
     finally:
         backend.cleanup()
+
+
+# ---- merge-baseline mtime walk ---------------------------------------------
+
+
+def test_newest_mtime_prunes_heavy_dirs(tmp_path):
+    """`_newest_mtime` runs on every acquire/release; it must skip heavy
+    generated/dependency trees so the walk stays proportional to source files
+    rather than stat-ing all of node_modules each turn."""
+    (tmp_path / "src.py").write_text("x = 1\n")
+    heavy = tmp_path / "node_modules" / "pkg"
+    heavy.mkdir(parents=True)
+    junk = heavy / "huge.js"
+    junk.write_text("// big\n")
+
+    # Make the pruned file *far* newer than anything else; if the walk visited
+    # node_modules it would pick this up as the baseline.
+    future = time.time() + 100_000
+    os.utime(junk, (future, future))
+
+    newest = _newest_mtime(tmp_path)
+    assert newest > 0, "should still see the real source file"
+    assert newest < future, "node_modules must be pruned from the mtime walk"
+

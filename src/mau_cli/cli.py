@@ -174,9 +174,12 @@ def main(ctx: click.Context) -> None:
     type=click.Choice(["auto", "shared", "worktree"], case_sensitive=False),
     default="auto",
     show_default=True,
-    help="Per-agent isolation backend. 'auto' uses git worktrees when the "
-    "workspace is a git repo, else shared. 'shared' forces the legacy "
-    "single-cwd mode. 'worktree' fails if the workspace isn't a git repo.",
+    help="Per-agent isolation backend. 'auto' uses 'shared' for greenfield "
+    "runs and per-agent git worktrees for brownfield runs in a clean git repo. "
+    "'shared' forces single-cwd mode (correct cumulative/integration "
+    "semantics). 'worktree' forces per-agent worktrees and fails if the "
+    "workspace isn't a git repo (note: worktrees reset to HEAD each turn and "
+    "exclude git-ignored files, so integration verifiers see a partial tree).",
 )
 def run(
     request: tuple[str, ...],
