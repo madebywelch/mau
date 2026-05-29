@@ -16,17 +16,19 @@ from __future__ import annotations
 
 import difflib
 import json
-import threading
+import os
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from mau_cli.agent import Agent
-from mau_cli.inference import InferenceBackend
+from mau_cli.inference import InferenceBackend, InferenceResult
 from mau_cli.isolation import (
     IsolationBackend,
     IsolationMode,
+    SharedWorkspaceBackend,
     make_isolation_backend,
 )
 from mau_cli.message_bus import MessageBus
@@ -105,8 +107,10 @@ class Orchestrator:
         self.bus = MessageBus(self.world)
         self.agents: dict[str, Agent] = {}
         self._executor = ThreadPoolExecutor(max_workers=concurrency)
-        self._lock = threading.Lock()
         self._global_turns = 0
+        # Last session.json payload we wrote; lets _persist skip byte-identical
+        # rewrites on idle/backoff loop iterations.
+        self._last_persisted: Optional[str] = None
         # Tick counter (not turns!). Increments every _tick() call, even
         # if no agent dispatched. Used to age error-backoff windows so a
         # stalled agent eventually gets reconsidered.
@@ -116,9 +120,9 @@ class Orchestrator:
         # rejected agent complete (which would freeze them out of `_ready_agents`).
         self._rejected_this_turn: set[str] = set()
         # Per-turn cwd: the worktree path the agent ran in this tick. Set in
-        # `_safe_turn`, read by `_apply_action` so verifiers run against the
-        # agent's pre-merge tree (the whole point of per-agent isolation).
-        # Cleared between ticks.
+        # `_acquire_cwd` (from `_tick`), read by `_apply_action` so verifiers
+        # run against the agent's pre-merge tree (the whole point of per-agent
+        # isolation). Cleared between ticks.
         self._turn_cwd: dict[str, Path] = {}
         # One-shot guards so the same termination event isn't emitted twice
         # from `_is_done` (which is polled on every loop iteration).
@@ -149,7 +153,6 @@ class Orchestrator:
         self._isolation_mode: IsolationMode = isolation
         self._isolation_initialized = False
         self.isolation: IsolationBackend  # set in _ensure_isolation
-        from mau_cli.isolation import SharedWorkspaceBackend
         self.isolation = SharedWorkspaceBackend(
             Path(workspace.code_dir) if workspace is not None else Path.cwd()
         )
@@ -165,9 +168,8 @@ class Orchestrator:
         self._isolation_initialized = True
         if self.world.workspace is None:
             return
-        from mau_cli.isolation import make_isolation_backend as _make
         try:
-            self.isolation = _make(
+            self.isolation = make_isolation_backend(
                 code_dir=Path(self.world.workspace.code_dir),
                 mode=self._isolation_mode,
                 brownfield=self.world.workspace.brownfield,
@@ -240,9 +242,8 @@ class Orchestrator:
             "Follow your role instructions exactly. End with the DELIVERABLE line."
         )
 
-        import time as _t
         self.world.discovery_status = "in_progress"
-        self.world.discovery_started_at = _t.monotonic()
+        self.world.discovery_started_at = time.monotonic()
         self._persist()
         self._emit("discovery_start", {"project_root": ws.code_dir, "reason": reason})
         try:
@@ -440,6 +441,15 @@ class Orchestrator:
             except Exception:
                 continue
 
+        # Open questions/escalations awaiting the human. Without this, a
+        # resume drops everything the team had bubbled up to the user before
+        # the interruption.
+        for m in snapshot.get("pending_user_questions") or []:
+            try:
+                self.world.pending_user_questions.append(_message_from_dict(m))
+            except Exception:
+                continue
+
         for name, a in (snapshot.get("agents") or {}).items():
             try:
                 state = _agent_state_from_dict(a)
@@ -529,18 +539,33 @@ class Orchestrator:
             return False
         return self.world.usage.cost_usd >= self.max_budget_usd
 
+    def _remaining_budget(self) -> Optional[float]:
+        """USD left before the cap, passed to each agentic turn so a single
+        runaway `claude -p` call is itself capped rather than only checked
+        between turns. None when no cap is set."""
+        if self.max_budget_usd is None:
+            return None
+        return max(0.0, self.max_budget_usd - self.world.usage.cost_usd)
+
     def _persist(self) -> None:
         """Atomically write session.json. Writes to a sibling .tmp file then
         renames — Path.write_text on its own is non-atomic and a kill mid-write
-        truncates the file, destroying any chance of resume."""
+        truncates the file, destroying any chance of resume.
+
+        Skips the write when the serialized snapshot is byte-identical to the
+        last one we wrote, so idle / error-backoff loop iterations don't churn
+        the disk re-emitting unchanged state."""
         if self.world.workspace is None:
             return
         try:
-            import os
+            payload = json.dumps(self.world.snapshot(), indent=2, default=str)
+            if payload == self._last_persisted:
+                return
             target = Path(self.world.workspace.session_file)
             tmp = target.with_suffix(target.suffix + ".tmp")
-            tmp.write_text(json.dumps(self.world.snapshot(), indent=2, default=str))
+            tmp.write_text(payload)
             os.replace(tmp, target)  # atomic on POSIX
+            self._last_persisted = payload
         except Exception as e:
             self._emit("persist_error", {"error": str(e)})
 
@@ -573,31 +598,41 @@ class Orchestrator:
         self._emit("tick", {"batch": [a.state.name for a in batch]})
 
         # Mark agents as thinking so they don't get re-picked while in flight.
-        import time as _t
         for agent in batch:
             agent.state.status = "thinking"
-            agent.state.thinking_started_at = _t.monotonic()
+            agent.state.thinking_started_at = time.monotonic()
 
-        futures: dict[Future, Agent] = {}
+        # Dispatch. Everything that reads or mutates shared WorldState happens
+        # here on the orchestrator thread: acquiring the per-agent cwd (worktree
+        # creation shells out to `git`, which must not race in the pool),
+        # building the prompt (reads agents/tasks/inbox/usage), and capturing
+        # the remaining budget. The worker (`_safe_infer`) receives a finished
+        # prompt and only shells out to the backend — it touches no shared
+        # state, which is what makes concurrency correct without a lock.
+        futures: dict[Future, tuple[Agent, str]] = {}
         for agent in batch:
             self._global_turns += 1
-            # Acquire the per-agent cwd on the orchestrator thread (worktree
-            # creation calls `git`, which we don't want racing inside the
-            # pool). For non-agentic roles, the isolation backend still
-            # hands back a path but no `git` call has to happen — shared
-            # returns code_dir; worktree creates exactly once per agent.
             cwd = self._acquire_cwd(agent)
-            futures[self._executor.submit(self._safe_turn, agent, cwd)] = agent
+            prompt = agent.build_user_prompt(self.world)
+            workspace_dir, extra_dirs = agent.infer_dirs(self.world, cwd)
+            remaining = self._remaining_budget()
+            future = self._executor.submit(
+                self._safe_infer, agent, prompt, workspace_dir, extra_dirs, remaining
+            )
+            futures[future] = (agent, prompt)
 
-        # Apply each completed turn synchronously in arrival order.
+        # Apply each completed turn synchronously in arrival order. Finalizing
+        # (usage accounting, inbox consumption, turn counter) and action
+        # application both run here on the main thread — the single writer.
         for future in list(futures.keys()):
-            agent = futures[future]
+            agent, prompt = futures[future]
             try:
-                turn = future.result()
+                result = future.result()
             except Exception as e:
                 self._handle_agent_error(agent, str(e))
                 continue
 
+            turn = agent.finalize_turn(self.world, prompt, result)
             self._apply_turn(agent, turn)
             # Successful turn — clear the consecutive-error counter so a
             # later transient flake gets a fresh backoff budget.
@@ -728,8 +763,24 @@ class Orchestrator:
             )
         self._turn_cwd.pop(agent.state.name, None)
 
-    def _safe_turn(self, agent: Agent, cwd: Path) -> AgentTurn:
-        return agent.run_turn(self.world, cwd=cwd)
+    def _safe_infer(
+        self,
+        agent: Agent,
+        prompt: str,
+        workspace_dir: Optional[str],
+        extra_dirs: Optional[list[str]],
+        max_budget_usd: Optional[float],
+    ) -> InferenceResult:
+        """Worker entry point: runs in the thread pool, performs only the
+        backend call against an already-built prompt, and returns the raw
+        result. Touches no WorldState — all mutation happens on the main
+        thread in `finalize_turn` / `_apply_turn`."""
+        return agent.infer(
+            prompt,
+            workspace_dir=workspace_dir,
+            extra_dirs=extra_dirs,
+            max_budget_usd=max_budget_usd,
+        )
 
     # ---- readiness --------------------------------------------------------
 
@@ -842,46 +893,48 @@ class Orchestrator:
     # ---- action application ----------------------------------------------
 
     def _apply_turn(self, agent: Agent, turn: AgentTurn) -> None:
-        with self._lock:
-            agent.state.status = turn.status
-            agent.state.thinking_started_at = None  # turn finished
-            agent.state.last_activity_at = now()
-            if turn.thoughts:
-                agent.state.notes.append(turn.thoughts[:500])
-            self._emit(
-                "agent_turn",
-                {
-                    "agent": agent.state.name,
-                    "thoughts": turn.thoughts,
-                    "status": turn.status,
-                    "actions": [a.get("type") for a in turn.actions],
-                },
-            )
+        # Runs only on the orchestrator's main thread, one turn at a time, so
+        # no lock is needed: this is the single writer of WorldState. Inference
+        # workers are pure (see `_safe_infer`).
+        agent.state.status = turn.status
+        agent.state.thinking_started_at = None  # turn finished
+        agent.state.last_activity_at = now()
+        if turn.thoughts:
+            agent.state.notes.append(turn.thoughts[:500])
+        self._emit(
+            "agent_turn",
+            {
+                "agent": agent.state.name,
+                "thoughts": turn.thoughts,
+                "status": turn.status,
+                "actions": [a.get("type") for a in turn.actions],
+            },
+        )
 
-            for action in turn.actions:
-                try:
-                    self._apply_action(agent, action)
-                except Exception as e:
-                    self._emit(
-                        "action_error",
-                        {"agent": agent.state.name, "action": action, "error": str(e)},
-                    )
-                    agent.state.notes.append(f"action error: {e}")
+        for action in turn.actions:
+            try:
+                self._apply_action(agent, action)
+            except Exception as e:
+                self._emit(
+                    "action_error",
+                    {"agent": agent.state.name, "action": action, "error": str(e)},
+                )
+                agent.state.notes.append(f"action error: {e}")
 
-            rejected = agent.state.name in self._rejected_this_turn
-            self._log_transcript(agent, turn, accepted=not rejected)
+        rejected = agent.state.name in self._rejected_this_turn
+        self._log_transcript(agent, turn, accepted=not rejected)
 
-            # Merge the agent's worktree back to the main workspace iff this
-            # turn wasn't rejected. Done *after* action application so the
-            # deliverable's verifiers and acceptance-criterion auto-checks
-            # have already run against the pre-merge tree (uncontaminated).
-            self._release_cwd(agent, merge=not rejected)
+        # Merge the agent's worktree back to the main workspace iff this
+        # turn wasn't rejected. Done *after* action application so the
+        # deliverable's verifiers and acceptance-criterion auto-checks
+        # have already run against the pre-merge tree (uncontaminated).
+        self._release_cwd(agent, merge=not rejected)
 
-            # If a deliverable was rejected this turn, force the agent back
-            # into `working` regardless of any later actions or turn-level status.
-            if rejected:
-                agent.state.status = "working"
-                self._rejected_this_turn.discard(agent.state.name)
+        # If a deliverable was rejected this turn, force the agent back
+        # into `working` regardless of any later actions or turn-level status.
+        if rejected:
+            agent.state.status = "working"
+            self._rejected_this_turn.discard(agent.state.name)
 
     def _log_transcript(self, agent: Agent, turn: AgentTurn, *, accepted: bool) -> None:
         """Append one JSONL line per agent turn to logs/<agent>.jsonl.
@@ -963,15 +1016,56 @@ class Orchestrator:
                     {"agent": agent.state.name, "reason": "cannot create tasks"},
                 )
                 return
+            assignee_name = str(action.get("assignee", ""))
+            if assignee_name not in self.world.agents:
+                # Reject rather than record an orphan. A task assigned to a
+                # non-existent agent never gets worked and never completes,
+                # which would silently wedge the run's completion predicate
+                # (no_open_tasks stays False forever). Route a blocker back to
+                # the creator so they spawn/rename and re-issue.
+                self._emit(
+                    "create_task_invalid",
+                    {
+                        "agent": agent.state.name,
+                        "reason": "unknown assignee",
+                        "assignee": assignee_name,
+                        "title": str(action.get("title", "")),
+                    },
+                )
+                self.bus.deliver(
+                    Message(
+                        from_agent="orchestrator",
+                        to_agent=agent.state.name,
+                        msg_type="blocker",
+                        subject="Task not created — unknown assignee",
+                        body=(
+                            f"You tried to create task {str(action.get('title', ''))!r} "
+                            f"assigned to {assignee_name!r}, but no agent by that name "
+                            "exists. spawn_agent first (or fix the name), then re-issue "
+                            "create_task."
+                        ),
+                    )
+                )
+                return
             task = Task(
                 id=str(action.get("id") or _id("task")),
                 title=str(action.get("title", "Untitled")),
                 description=str(action.get("description", "")),
-                assignee=str(action.get("assignee", "")),
+                assignee=assignee_name,
                 creator=agent.state.name,
                 depends_on=list(action.get("depends_on", []) or []),
                 acceptance_criteria=list(action.get("acceptance_criteria", []) or []),
             )
+            # Surface dangling dependency IDs. Forward references are legal
+            # (the dep may be created later this turn or by a peer), so we warn
+            # rather than reject — but a permanently-unknown dep leaves the task
+            # blocked forever, and this event is the breadcrumb for that.
+            unknown_deps = [d for d in task.depends_on if d not in self.world.tasks]
+            if unknown_deps:
+                self._emit(
+                    "task_dependency_unknown",
+                    {"task_id": task.id, "unknown": unknown_deps},
+                )
             self.world.tasks[task.id] = task
             assignee = self.world.agents.get(task.assignee)
             if assignee is not None:
@@ -1799,7 +1893,6 @@ def _agent_state_from_dict(d: dict[str, Any]) -> AgentState:
         specialization=d.get("specialization", ""),
         status=d.get("status", "idle"),
         inbox=[_message_from_dict(m) for m in d.get("inbox") or []],
-        history=[_message_from_dict(m) for m in d.get("history") or []],
         assigned_tasks=list(d.get("assigned_tasks") or []),
         deliverables=list(d.get("deliverables") or []),
         files_touched=list(d.get("files_touched") or []),

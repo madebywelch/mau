@@ -179,7 +179,7 @@ specialist headcount and turn budget.
 | `--no-tui` | Skip the live TUI; print events as plain text. |
 | `--save PATH` | Also persist a copy of `session.json` to this path. |
 | `--policy RULE` | Repeatable. Seed a durable policy. See `--policy 'role:<role>=<rule>'`. |
-| `--isolation {auto,shared,worktree}` | Per-agent isolation backend. `auto` picks worktree in a git repo. |
+| `--isolation {auto,shared,worktree}` | Per-agent isolation. `auto` = `shared` for greenfield, per-agent git worktrees for brownfield in a clean repo. `shared` forces single-cwd (correct integration semantics); `worktree` forces per-agent worktrees (git repo required; resets to HEAD each turn, excludes ignored files). |
 | `--version` | Show version and exit. |
 | `-h, --help` | Show help and exit. |
 

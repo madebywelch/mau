@@ -236,7 +236,6 @@ class AgentState:
     specialization: str = ""  # e.g. "auth screens", "checkout flow"
     status: AgentStatus = "idle"
     inbox: list[Message] = field(default_factory=list)
-    history: list[Message] = field(default_factory=list)
     assigned_tasks: list[str] = field(default_factory=list)
     deliverables: list[str] = field(default_factory=list)
     files_touched: list[str] = field(default_factory=list)  # paths relative to workspace
@@ -492,6 +491,9 @@ class WorldState:
             "agents": {n: asdict(a) for n, a in self.agents.items()},
             "tasks": {tid: asdict(t) for tid, t in self.tasks.items()},
             "messages": [asdict(m) for m in self.messages],
+            "pending_user_questions": [
+                asdict(m) for m in self.pending_user_questions
+            ],
             "shared_docs": {
                 name: [asdict(v) for v in versions]
                 for name, versions in self.shared_docs.items()

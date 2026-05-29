@@ -43,6 +43,24 @@ CLAUDE_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0)
 CLAUDE_INVOKE_TIMEOUT_SECONDS: int = 1800
 
 
+def _terminate_process_tree(proc: "subprocess.Popen[str]", *, hard: bool) -> None:
+    """Best-effort kill of the child's whole process group so MCP-server
+    grandchildren don't keep pipes open and wedge the call. Uses
+    `killpg`/`getpgid` on POSIX; on platforms without process-group signalling
+    (e.g. Windows) it falls back to terminating just the child. `SIGKILL` is
+    referenced only inside the POSIX branch, where it always exists."""
+    try:
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+            sig = signal.SIGKILL if hard else signal.SIGTERM
+            os.killpg(os.getpgid(proc.pid), sig)
+        elif hard:
+            proc.kill()
+        else:
+            proc.terminate()
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def _run_with_group_kill(
     cmd: list[str],
     *,
@@ -68,17 +86,11 @@ def _run_with_group_kill(
         stdout, stderr = proc.communicate(timeout=timeout)
         return proc, stdout, stderr
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        _terminate_process_tree(proc, hard=False)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            _terminate_process_tree(proc, hard=True)
             proc.wait()
         try:
             stdout, stderr = proc.communicate(timeout=2)
