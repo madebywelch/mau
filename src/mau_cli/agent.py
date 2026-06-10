@@ -22,6 +22,7 @@ from mau_cli.schemas import (
     AgentState,
     AgentTurn,
     CODE_GEN_ROLES,
+    MANAGER_ROLES,
     Role,
     TokenUsage,
     WorldState,
@@ -34,6 +35,25 @@ from mau_cli.schemas import (
 # blowups. When a doc exceeds this, the prompt prepends a clear marker so
 # the agent knows it's looking at a truncated copy.
 SHARED_DOC_HARD_CAP = 60_000
+
+# Docs every agent sees regardless of team scope: the product spec is the
+# org's single shared source of truth, and the brownfield codebase map is
+# ground truth about the repo. Everything else renders team-locally — that
+# is what keeps prompt size Θ(team), not Θ(org), as the org grows.
+GLOBAL_DOCS = frozenset({"prd.md", "codebase.md"})
+
+# Doc versions published by the harness rather than by a teammate (initial
+# disk load, codebase analyst, resume rehydration). Visible to everyone —
+# there is no author team to scope them to.
+SYSTEM_AUTHORS = frozenset({"system", "disk", "legacy", "user", "orchestrator"})
+
+# The exact final-line contract for specialist turns. Single source of truth:
+# rendered into every specialist prompt AND quoted verbatim in the
+# orchestrator's corrective blocker when an agent keeps omitting/mangling it.
+DELIVERABLE_FORMAT_REMINDER = (
+    "<DELIVERABLE>{\"title\": \"...\", \"summary\": \"...\", "
+    "\"files_touched\": [\"path/relative/to/workspace\", ...]}</DELIVERABLE>"
+)
 
 
 @lru_cache(maxsize=None)
@@ -81,6 +101,13 @@ class Agent:
         lines.append(f"STATUS: {s.status}")
         lines.append("")
 
+        if s.brief:
+            # The mandate persists every turn — the spawn directive that
+            # carried it is consumed from the inbox after one read.
+            lines.append("YOUR_MANDATE:")
+            lines.append(s.brief)
+            lines.append("")
+
         lines.append("ORIGINAL_USER_REQUEST:")
         lines.append(world.request)
         lines.append("")
@@ -106,20 +133,67 @@ class Agent:
                 )
             lines.append("")
 
-        lines.append("TEAM_ROSTER:")
-        for agent in world.agents.values():
-            spec = f" ({agent.specialization})" if agent.specialization else ""
-            lines.append(f"  - {agent.name} [{agent.role.value}{spec}] — {agent.status}")
-        lines.append("")
+        # Team-local roster slice. An agent sees its manager, its peers
+        # (same manager), and its direct reports — not the whole org. This
+        # is what keeps prompts Θ(team) as the org scales to hundreds.
+        # Legacy fallback: agents without a manager edge (pre-fractal
+        # sessions, directly-constructed test agents) see the full roster.
+        legacy_scope = s.manager is None and s.role != Role.PRODUCT
+        if legacy_scope:
+            lines.append("TEAM_ROSTER:")
+            for agent in world.agents.values():
+                spec = f" ({agent.specialization})" if agent.specialization else ""
+                lines.append(
+                    f"  - {agent.name} [{agent.role.value}{spec}] — {agent.status}"
+                )
+            lines.append("")
+        else:
+            lines.append("TEAM:")
+            if s.manager and s.manager in world.agents:
+                m = world.agents[s.manager]
+                lines.append(
+                    f"  MANAGER: {m.name} [{m.role.value}] — {m.status}"
+                )
+            else:
+                lines.append("  MANAGER: the human user")
+            reports = [a for a in world.agents.values() if a.manager == s.name]
+            if reports:
+                lines.append("  YOUR_REPORTS:")
+                for a in reports:
+                    spec = f" ({a.specialization})" if a.specialization else ""
+                    lines.append(
+                        f"    - {a.name} [{a.role.value}{spec}] — {a.status}"
+                    )
+            if s.manager:
+                peers = [
+                    a
+                    for a in world.agents.values()
+                    if a.manager == s.manager and a.name != s.name
+                ]
+                if peers:
+                    lines.append("  PEERS:")
+                    for a in peers:
+                        spec = f" ({a.specialization})" if a.specialization else ""
+                        lines.append(
+                            f"    - {a.name} [{a.role.value}{spec}] — {a.status}"
+                        )
+            lines.append(
+                f"  ORG: {len(world.agents)} agents total; you see only your team."
+            )
+            lines.append("")
 
         # Shared docs are *the* coordination artifact. Specialists read them
         # to learn the contract; planners write them to publish it. We inject
         # the full latest content plus the version hash so every agent sees
         # the same mental copy and stale-version blunders are detectable.
+        # Scope: global docs + docs authored within this agent's team + docs
+        # pulled in via task doc_refs. Cross-team contracts travel by
+        # doc_refs, not by broadcasting every doc to every agent.
         self.last_doc_versions = {}
-        if world.shared_docs:
+        visible_docs = self._visible_doc_names(world, legacy_scope=legacy_scope)
+        if visible_docs:
             lines.append("SHARED_DOCS:")
-            for name in world.shared_docs:
+            for name in visible_docs:
                 version = world.get_doc_version(name)
                 if version is None:
                     continue
@@ -171,6 +245,28 @@ class Agent:
                     f"  - [{p.id}] (scope={p.scope}, source={p.source}) {p.text}"
                 )
             lines.append("")
+
+        # Managers need to see the state of tasks they created — without
+        # this they cannot decide when to verify roll-ups, retire reports,
+        # or report their epic complete.
+        if s.role in MANAGER_ROLES:
+            created_open = [
+                t
+                for t in world.tasks.values()
+                if t.creator == s.name and t.status not in ("complete", "cancelled")
+            ]
+            created_done = sum(
+                1
+                for t in world.tasks.values()
+                if t.creator == s.name and t.status in ("complete", "cancelled")
+            )
+            if created_open or created_done:
+                lines.append("TASKS_YOU_CREATED:")
+                for t in created_open:
+                    lines.append(f"  - {t.id} [{t.status}] {t.title} → {t.assignee}")
+                if created_done:
+                    lines.append(f"  ({created_done} already complete/cancelled)")
+                lines.append("")
 
         my_tasks = [world.tasks[tid] for tid in s.assigned_tasks if tid in world.tasks]
         if my_tasks:
@@ -233,7 +329,7 @@ class Agent:
                 "   Be concrete and complete — this is not a sketch, real code goes on disk.\n"
                 "3. Acceptance criteria must each be verifiably met by your changes.\n"
                 "4. End your final message with EXACTLY one line:\n"
-                "   <DELIVERABLE>{\"title\": \"...\", \"summary\": \"...\", \"files_touched\": [\"path/relative/to/workspace\", ...]}</DELIVERABLE>\n"
+                f"   {DELIVERABLE_FORMAT_REMINDER}\n"
                 "5. The summary will be shown to downstream teammates and to the user — make it informative."
             )
         else:
@@ -242,6 +338,41 @@ class Agent:
                 "If you have nothing useful to do, respond with status=complete."
             )
         return "\n".join(lines)
+
+    def _visible_doc_names(
+        self, world: WorldState, *, legacy_scope: bool
+    ) -> list[str]:
+        """Shared docs this agent's prompt renders, in publication order:
+        global docs, harness-published docs, docs authored by anyone on the
+        agent's team (self, manager, direct reports — ANY version, so a doc
+        doesn't vanish from a worker's prompt when a third party edits it),
+        and docs named in `doc_refs` of the agent's open tasks."""
+        if legacy_scope:
+            return list(world.shared_docs.keys())
+        s = self.state
+        team = {s.name}
+        if s.manager:
+            team.add(s.manager)
+        team.update(
+            a.name for a in world.agents.values() if a.manager == s.name
+        )
+        doc_refs: set[str] = set()
+        for tid in s.assigned_tasks:
+            t = world.tasks.get(tid)
+            if t is not None and t.status not in ("complete", "cancelled"):
+                doc_refs.update(t.doc_refs)
+        visible: list[str] = []
+        for name, versions in world.shared_docs.items():
+            if (
+                name in GLOBAL_DOCS
+                or name in doc_refs
+                or any(
+                    v.author in team or v.author in SYSTEM_AUTHORS
+                    for v in versions
+                )
+            ):
+                visible.append(name)
+        return visible
 
     # ---- turn dispatch --------------------------------------------------
 
@@ -342,13 +473,35 @@ class Agent:
                 actions=[],
             )
 
-        if not deliverable:
-            # Specialist produced no DELIVERABLE block — treat as a soft note.
+        if deliverable.get("_parse_error"):
+            # A DELIVERABLE block was present but its JSON didn't parse.
+            # Surface it as a tracked failure, not a silent note — the
+            # orchestrator counts these and corrects/escalates.
             return AgentTurn(
-                thoughts="No DELIVERABLE block; agent text saved as note.",
+                thoughts="DELIVERABLE block present but JSON-invalid.",
                 status="working",
                 actions=[
-                    {"type": "note", "body": result.raw_text[-1000:]},
+                    {
+                        "type": "no_deliverable",
+                        "kind": "parse_error",
+                        "error": str(deliverable.get("_parse_error", "")),
+                        "block_preview": str(deliverable.get("_raw_block", "")),
+                        "raw_tail": result.raw_text[-1500:],
+                    }
+                ],
+            )
+
+        if not deliverable:
+            # Specialist produced no DELIVERABLE block at all.
+            return AgentTurn(
+                thoughts="No DELIVERABLE block in response.",
+                status="working",
+                actions=[
+                    {
+                        "type": "no_deliverable",
+                        "kind": "missing",
+                        "raw_tail": result.raw_text[-1500:],
+                    }
                 ],
             )
 

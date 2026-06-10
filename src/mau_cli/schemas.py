@@ -29,7 +29,11 @@ class Role(str, Enum):
     USER = "user"  # Pseudo-role for the human-in-the-loop
 
 
-SUPERVISOR_OF: dict[Role, Optional[Role]] = {
+# Resume backfill ONLY — live escalation/routing uses `AgentState.manager`
+# (the agent that spawned you is your manager). Sessions persisted before the
+# fractal-org change lack `manager`, so `load_from_disk` reconstructs a
+# plausible tree from this legacy role map.
+LEGACY_SUPERVISOR_OF: dict[Role, Optional[Role]] = {
     Role.USER: None,
     Role.PRODUCT: Role.USER,
     Role.ENGINEERING_MANAGER: Role.PRODUCT,
@@ -42,11 +46,29 @@ SUPERVISOR_OF: dict[Role, Optional[Role]] = {
 }
 
 
-# Roles that may spawn additional agents. Specialists cannot.
-ROLES_THAT_SPAWN: set[Role] = {
-    Role.PRODUCT,
-    Role.ENGINEERING_MANAGER,
-    Role.TECH_LEAD,
+# Roles that manage: they may spawn agents, create tasks, and get the larger
+# manager turn cap. Specialists do none of those.
+MANAGER_ROLES: frozenset[Role] = frozenset(
+    {Role.PRODUCT, Role.ENGINEERING_MANAGER, Role.TECH_LEAD}
+)
+
+# Which roles each manager role may spawn. Depth comes from tech_lead →
+# tech_lead edges (sub-leads per domain), not from new role names: an EM
+# splits the PRD into epics and spawns one tech lead per epic; a tech lead
+# whose domain outgrows their span of control spawns sub-leads.
+SPAWNABLE_BY: dict[Role, frozenset[Role]] = {
+    Role.PRODUCT: frozenset({Role.ENGINEERING_MANAGER}),
+    Role.ENGINEERING_MANAGER: frozenset({Role.TECH_LEAD}),
+    Role.TECH_LEAD: frozenset(
+        {
+            Role.TECH_LEAD,
+            Role.FRONTEND,
+            Role.BACKEND,
+            Role.DATABASE,
+            Role.QA,
+            Role.DEVOPS,
+        }
+    ),
 }
 
 
@@ -108,6 +130,12 @@ class AcceptanceCriterion:
     last_status: CriterionStatus = "pending"
     last_summary: Optional[str] = None
     last_checked_turn: Optional[int] = None
+    # How many consecutive checks failed with an IDENTICAL summary. Resets on
+    # pass or whenever the failure text changes. The orchestrator escalates to
+    # the agent's manager instead of re-issuing the same retry blocker once
+    # this crosses VERIFY_LOOP_ESCALATE_AT — a stuck verifier loop is a
+    # coordination problem, not something the same agent solves by retry N+1.
+    consecutive_identical_failures: int = 0
 
 
 def _coerce_criteria(
@@ -129,6 +157,12 @@ def _coerce_criteria(
                 continue
             verifier = item.get("verifier")
             spec = item.get("spec")
+            try:
+                identical_failures = int(
+                    item.get("consecutive_identical_failures") or 0
+                )
+            except (TypeError, ValueError):
+                identical_failures = 0
             out.append(
                 AcceptanceCriterion(
                     text=text,
@@ -137,6 +171,7 @@ def _coerce_criteria(
                     last_status=item.get("last_status", "pending"),
                     last_summary=item.get("last_summary"),
                     last_checked_turn=item.get("last_checked_turn"),
+                    consecutive_identical_failures=identical_failures,
                 )
             )
     return out
@@ -185,6 +220,10 @@ class Task:
     creator: str = ""
     status: TaskStatus = "pending"
     depends_on: list[str] = field(default_factory=list)  # task IDs
+    # Shared-doc names the assignee needs even though they're outside the
+    # assignee's team scope (prompts only render team-authored docs plus
+    # these). The precision tool for cross-team contracts.
+    doc_refs: list[str] = field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
     deliverable_summary: Optional[str] = None
     # doc name → hash of the version the agent was looking at when the
@@ -234,6 +273,14 @@ class AgentState:
     name: str
     role: Role
     specialization: str = ""  # e.g. "auth screens", "checkout flow"
+    # Name of the agent that spawned this one — the manager. None only for
+    # the root (product), whose escalations go to the human user. The org
+    # tree is derived from these edges (reports = agents whose manager is
+    # me); there is no separate roster to keep in sync.
+    manager: Optional[str] = None
+    # The mandate this agent was spawned with. Re-rendered into every prompt
+    # (the inbox is consumed once, but the purpose must persist).
+    brief: str = ""
     status: AgentStatus = "idle"
     inbox: list[Message] = field(default_factory=list)
     assigned_tasks: list[str] = field(default_factory=list)
@@ -251,15 +298,35 @@ class AgentState:
     # forever).
     consecutive_errors: int = 0
     last_error_at_turn: Optional[int] = None
+    # Consecutive evaluations with nothing to do (empty inbox, no open
+    # assigned tasks). At AUTO_RETIRE_IDLE_TICKS the orchestrator retires the
+    # agent so spawned-but-finished workers don't wedge the completion gate.
+    idle_ticks: int = 0
+    # Consecutive specialist turns that produced no parseable DELIVERABLE
+    # block (missing or JSON-invalid). Thresholds: corrective blocker,
+    # manager escalation, force-complete. Resets on any coherent turn.
+    consecutive_no_deliverable: int = 0
+    # Escalations that found no live manager AND no human (unattended runs).
+    # At UNRESOLVED_ESCALATIONS_GIVEUP_AT the agent is force-completed so an
+    # unattended run never wedges on an unanswerable question.
+    unanswered_escalations: int = 0
+    # Ad-hoc `verify` action failure streaks, keyed "verifier:summary-hash".
+    # Bounds identical verify-failure retry loops the same way criterion
+    # streaks do.
+    verify_failures: dict[str, int] = field(default_factory=dict)
+    # When set, skip this agent until the orchestrator's evaluation counter
+    # reaches this value — a bounded pause after a verify-loop escalation so
+    # the manager gets a window to intervene before the agent retries. Any
+    # intervention message (blocker/directive/escalation/answer) releases the
+    # hold early. Not meaningful across resume (the counter resets), so
+    # rehydration always clears it.
+    hold_until_tick: Optional[int] = None
     notes: list[str] = field(default_factory=list)  # internal scratchpad
     usage: TokenUsage = field(default_factory=TokenUsage)
     # Wall-clock when this agent's current turn started (None if idle/complete).
     # The TUI uses this to render an elapsed-time indicator next to the spinner.
     thinking_started_at: Optional[float] = None
     last_activity_at: float = field(default_factory=now)
-
-    def supervisor(self) -> Optional[Role]:
-        return SUPERVISOR_OF.get(self.role)
 
 
 # Roles that produce real code (file edits) vs roles that produce only
@@ -282,6 +349,7 @@ ActionType = Literal[
     "send_message",
     "create_task",
     "spawn_agent",
+    "retire_agent",
     "deliverable",
     "escalate",
     "complete",
@@ -292,6 +360,9 @@ ActionType = Literal[
     "write_doc",
     "record_policy",
     "retire_policy",
+    # Synthesized by Agent._result_to_turn when a specialist turn has no
+    # parseable DELIVERABLE block — agents never emit this themselves.
+    "no_deliverable",
 ]
 
 
