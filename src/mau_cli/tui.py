@@ -49,6 +49,17 @@ STATUS_GLYPHS: dict[str, str] = {
     "complete": "✓",
 }
 
+# Team panel truncation for large (fractal) orgs: show the most interesting
+# rows, summarize the rest. Order: live activity first, finished work last.
+TEAM_PANEL_MAX_ROWS = 24
+_STATUS_PRIORITY: dict[str, int] = {
+    "thinking": 0,
+    "blocked": 1,
+    "working": 2,
+    "idle": 3,
+    "complete": 4,
+}
+
 # Braille spinner — same frame set as Rich's "dots" spinner.
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -238,7 +249,18 @@ class TUI:
         table.add_column("tokens (in/out)", justify="right", style="dim", no_wrap=True)
         table.add_column("$", justify="right", style="green", no_wrap=True)
 
-        for agent in world.agents.values():
+        # Fractal orgs can run to hundreds of agents — cap the visible rows,
+        # most-interesting first (active before complete, then most recently
+        # active), and summarize the rest in a truncation row.
+        agents = sorted(
+            world.agents.values(),
+            key=lambda a: (
+                _STATUS_PRIORITY.get(a.status, 5),
+                -a.last_activity_at,
+            ),
+        )
+        hidden = agents[TEAM_PANEL_MAX_ROWS:]
+        for agent in agents[:TEAM_PANEL_MAX_ROWS]:
             color = ROLE_COLORS.get(agent.role.value, "white")
             state_text = Text()
             if agent.status == "thinking" and agent.thinking_started_at:
@@ -272,6 +294,17 @@ class TUI:
                 str(agent.turns_taken),
                 tokens,
                 f"${agent.usage.cost_usd:.3f}",
+            )
+
+        if hidden:
+            h_complete = sum(1 for a in hidden if a.status == "complete")
+            table.add_row(
+                Text(
+                    f"… +{len(hidden)} more "
+                    f"({h_complete} complete, {len(hidden) - h_complete} other)",
+                    style="dim italic",
+                ),
+                "", "", "", "", "",
             )
 
         if not world.agents:

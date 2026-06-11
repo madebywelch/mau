@@ -23,7 +23,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from mau_cli.agent import Agent
+from mau_cli.agent import Agent, DELIVERABLE_FORMAT_REMINDER
 from mau_cli.inference import InferenceBackend, InferenceResult
 from mau_cli.isolation import (
     IsolationBackend,
@@ -37,11 +37,12 @@ from mau_cli.schemas import (
     AgentState,
     AgentTurn,
     DocVersion,
+    LEGACY_SUPERVISOR_OF,
+    MANAGER_ROLES,
     Message,
     Policy,
-    ROLES_THAT_SPAWN,
     Role,
-    SUPERVISOR_OF,
+    SPAWNABLE_BY,
     Task,
     TokenUsage,
     Workspace,
@@ -59,7 +60,20 @@ DEFAULT_MAX_TURNS = 80
 DEFAULT_MAX_AGENTS = 12
 DEFAULT_CONCURRENCY = 3
 ESCALATION_AFTER_BLOCKED_TURNS = 3
-MAX_TURNS_PER_AGENT = 12  # safety cap per agent to avoid runaway loops
+MAX_TURNS_PER_AGENT = 12  # safety cap per worker to avoid runaway loops
+# Managers coordinate for the whole run (spawn waves, verify roll-ups, retire
+# reports), so their cap must scale with the org's lifetime, not a worker's.
+MAX_TURNS_PER_MANAGER = 40
+
+# Fractal-org limits. Span of control counts *active* (non-complete) direct
+# reports — retiring a report frees a slot, enabling wave staffing. Past the
+# span, the manager is told to spawn a sub-lead instead: 8 reports at depth 4
+# is 1→8→64→512 capacity, so "hundreds of agents" never needs a wider fanout.
+MAX_DIRECT_REPORTS = 8
+# Consecutive evaluations with no inbox and no open work before an agent is
+# auto-retired. The grace window damps retire/reactivate thrash when work
+# arrives in waves; reactivation (directive/task/blocker) undoes retirement.
+AUTO_RETIRE_IDLE_TICKS = 3
 
 # Bug 5 — consecutive-error backoff. After an agent_error we skip the agent
 # for `min(consecutive_errors, ERROR_BACKOFF_TICKS)` subsequent ticks so the
@@ -70,6 +84,27 @@ MAX_TURNS_PER_AGENT = 12  # safety cap per agent to avoid runaway loops
 ERROR_BACKOFF_TICKS = 3
 ERROR_ESCALATE_AT = 3
 ERROR_GIVEUP_AT = 5
+
+# No-deliverable discipline. A specialist turn without a parseable
+# <DELIVERABLE> block is recorded (not silently dropped); consecutive
+# occurrences get a corrective blocker quoting the required format, then a
+# manager escalation, then force-complete — a confused agent must not burn
+# its whole turn budget producing notes nobody reads.
+NO_DELIVERABLE_CORRECT_AT = 2
+NO_DELIVERABLE_ESCALATE_AT = 4
+NO_DELIVERABLE_GIVEUP_AT = 6
+
+# Unattended runs: escalations that top out at the (absent) human are parked;
+# after this many the stuck agent is force-completed so the rest of the org
+# converges instead of wedging on an unanswerable question.
+UNRESOLVED_ESCALATIONS_GIVEUP_AT = 2
+
+# Verify-loop bounding. When the same criterion (or ad-hoc verify) fails with
+# an IDENTICAL summary this many times, stop re-blocking the agent and
+# escalate to its manager — then hold the agent a few evaluations so the
+# manager gets a window to redirect before the next retry.
+VERIFY_LOOP_ESCALATE_AT = 3
+VERIFY_HOLD_EVALUATIONS = 3
 
 # Re-scan the codebase and re-publish shared/codebase.md every N landed
 # deliverables in brownfield mode. The paper calls out that one-shot scans
@@ -92,6 +127,7 @@ class Orchestrator:
         on_event: Optional[Callable[[str, dict[str, Any]], None]] = None,
         logs_dir: Optional[Path] = None,
         isolation: IsolationMode = "auto",
+        unattended: bool = False,
     ):
         self.backend = backend
         self.max_turns = max_turns
@@ -99,12 +135,16 @@ class Orchestrator:
         self.concurrency = concurrency
         self.max_budget_usd = max_budget_usd
         self.on_event = on_event or (lambda *_: None)
+        # No human is watching: escalations that top out at the user get a
+        # decide-and-proceed self-directive instead of waiting for an answer
+        # that will never come (see _escalate_or_park).
+        self.unattended = unattended
 
         self.world = WorldState()
         if workspace is not None:
             workspace.ensure()
             self.world.workspace = workspace
-        self.bus = MessageBus(self.world)
+        self.bus = MessageBus(self.world, on_event=self._emit)
         self.agents: dict[str, Agent] = {}
         self._executor = ThreadPoolExecutor(max_workers=concurrency)
         self._global_turns = 0
@@ -119,6 +159,13 @@ class Orchestrator:
         # The "complete" action handler consults this to avoid marking a
         # rejected agent complete (which would freeze them out of `_ready_agents`).
         self._rejected_this_turn: set[str] = set()
+        # Per-turn mandate context for spawn validation: assignees of tasks
+        # created this turn and targets of directive/task messages sent this
+        # turn. A spawn without a brief must name its new agent in one of
+        # these — "every agent has a purpose" is enforced, not aspirational.
+        # Computed in _apply_turn before the action loop, cleared after.
+        self._turn_task_assignees: set[str] = set()
+        self._turn_directive_targets: set[str] = set()
         # Per-turn cwd: the worktree path the agent ran in this tick. Set in
         # `_acquire_cwd` (from `_tick`), read by `_apply_action` so verifiers
         # run against the agent's pre-merge tree (the whole point of per-agent
@@ -352,12 +399,22 @@ class Orchestrator:
                 progressed = self._tick()
                 self._persist()
                 if not progressed:
-                    # Agents in error-backoff aren't a stall — they'll be
-                    # eligible again after a few ticks elapse. Skip the
-                    # stall break in that case so the backoff window
-                    # actually plays out.
+                    # Agents in error-backoff (or a post-escalation hold)
+                    # aren't a stall — they'll be eligible again after a few
+                    # ticks elapse. Skip the stall break in that case so the
+                    # backoff window actually plays out.
                     if self._any_agent_in_error_backoff():
                         continue
+                    # Idle agents counting down to auto-retirement need the
+                    # loop to keep evaluating them; the countdown completing
+                    # is what lets the org converge level by level.
+                    if self._any_retirement_pending():
+                        continue
+                    # _ready_agents side effects (auto-retire, turn caps) can
+                    # flip the last agent to complete inside a no-dispatch
+                    # tick — re-check before declaring a stall.
+                    if self._is_done():
+                        break
                     if not self._unblock_stalled():
                         self._emit("stall", {})
                         break
@@ -426,6 +483,7 @@ class Orchestrator:
                     creator=t.get("creator", ""),
                     status=t.get("status", "pending"),
                     depends_on=list(t.get("depends_on") or []),
+                    doc_refs=list(t.get("doc_refs") or []),
                     acceptance_criteria=list(t.get("acceptance_criteria") or []),
                     deliverable_summary=t.get("deliverable_summary"),
                     satisfied_doc_versions=dict(t.get("satisfied_doc_versions") or {}),
@@ -463,7 +521,21 @@ class Orchestrator:
             self.world.agents[name] = state
             self.agents[name] = Agent(state, self.backend)
 
+        self._backfill_managers()
         return bool(self.agents) or bool(self.world.tasks)
+
+    def _backfill_managers(self) -> None:
+        """Resume back-compat: sessions persisted before the fractal-org
+        change carry no manager edges. Reconstruct a plausible tree from the
+        legacy role map so escalation routing works after resume. New
+        sessions always persist `manager`, so this is a no-op for them."""
+        for state in self.world.agents.values():
+            if state.manager is not None or state.role == Role.PRODUCT:
+                continue
+            legacy_role = LEGACY_SUPERVISOR_OF.get(state.role)
+            if legacy_role is None or legacy_role == Role.USER:
+                continue
+            state.manager = self._first_agent_of_role(legacy_role)
 
     def _rehydrate_shared_docs(self, raw: Any) -> None:
         """Restore shared_docs from a snapshot. Tolerates both the new
@@ -679,6 +751,7 @@ class Orchestrator:
                 "agent_given_up",
                 {
                     "agent": agent.state.name,
+                    "reason": "consecutive_errors",
                     "consecutive_errors": agent.state.consecutive_errors,
                     "last_error": error,
                 },
@@ -696,14 +769,8 @@ class Orchestrator:
             agent.state.status = "blocked"
 
     def _notify_supervisor_of_error(self, agent: Agent, error: str) -> None:
-        """Deliver a blocker to the agent's supervisor (or the user if the
-        agent sits at the top of SUPERVISOR_OF)."""
-        supervisor_role = SUPERVISOR_OF.get(agent.state.role)
-        target_name: Optional[str] = None
-        if supervisor_role is not None and supervisor_role != Role.USER:
-            target_name = self._first_agent_of_role(supervisor_role)
-        if target_name is None:
-            target_name = "user"
+        """Deliver a blocker to the agent's manager (or park it for the user
+        when the chain tops out — see _escalate_or_park)."""
         body = (
             f"Agent {agent.state.name} ({agent.state.role.value}) has failed "
             f"{agent.state.consecutive_errors} turns in a row. "
@@ -713,20 +780,18 @@ class Orchestrator:
             "their contribution will be lost — reassign, redirect, or "
             "investigate."
         )
-        self.bus.deliver(
-            Message(
-                from_agent="orchestrator",
-                to_agent=target_name,
-                msg_type="blocker",
-                subject=f"{agent.state.name} stuck after {agent.state.consecutive_errors} errors",
-                body=body,
-            )
+        target_name = self._escalate_or_park(
+            agent,
+            subject=f"{agent.state.name} stuck after {agent.state.consecutive_errors} errors",
+            body=body,
+            msg_type="blocker",
+            from_agent="orchestrator",
         )
         self._emit(
             "agent_error_escalated",
             {
                 "agent": agent.state.name,
-                "supervisor": target_name,
+                "supervisor": target_name or "user",
                 "consecutive_errors": agent.state.consecutive_errors,
                 "last_error": error,
             },
@@ -784,44 +849,79 @@ class Orchestrator:
 
     # ---- readiness --------------------------------------------------------
 
-    # Message types that warrant reactivating a completed agent.
-    REACTIVATING_MSG_TYPES = ("directive", "task", "blocker")
+    # Message types that warrant reactivating a completed agent. Managers are
+    # additionally reactivated by "deliverable" (see _has_reactivating_msg):
+    # a report's roll-up must wake them to verify, aggregate, and retire.
+    REACTIVATING_MSG_TYPES = ("directive", "task", "blocker", "escalation", "question")
+
+    def _in_error_backoff(self, s: AgentState) -> bool:
+        """True while `s` is being skipped after consecutive inference errors:
+        min(consecutive_errors, ERROR_BACKOFF_TICKS) means 1 tick after the
+        first error, 2 after the second, capped to keep the wait bounded.
+        `_tick_count` is the evaluation counter — incremented once per
+        scheduler pass even when nothing dispatched, so the window ages for a
+        sole-failing agent too. An intervention message (blocker / directive /
+        escalation / answer) clears `last_error_at_turn` via the message bus,
+        granting one immediate retry."""
+        return bool(
+            s.consecutive_errors
+            and s.last_error_at_turn is not None
+            and (self._tick_count - s.last_error_at_turn)
+            < min(s.consecutive_errors, ERROR_BACKOFF_TICKS)
+        )
+
+    def _held(self, s: AgentState) -> bool:
+        """True while `s` is paused after a verify-loop escalation (a window
+        for the manager to intervene before the next identical retry). The
+        hold expires automatically against the evaluation counter; expiry
+        clears the field so persistence doesn't carry a stale hold."""
+        if s.hold_until_tick is None:
+            return False
+        if self._tick_count >= s.hold_until_tick:
+            s.hold_until_tick = None
+            return False
+        return True
+
+    def _turn_cap_for(self, state: AgentState) -> int:
+        return (
+            MAX_TURNS_PER_MANAGER
+            if state.role in MANAGER_ROLES
+            else MAX_TURNS_PER_AGENT
+        )
+
+    def _has_reactivating_msg(self, s: AgentState) -> bool:
+        for m in s.inbox:
+            if m.msg_type in self.REACTIVATING_MSG_TYPES:
+                return True
+            if m.msg_type == "deliverable" and s.role in MANAGER_ROLES:
+                return True
+        return False
 
     def _ready_agents(self) -> list[Agent]:
         """Agents eligible to act this tick: status not complete/thinking,
-        either inbox is non-empty OR they have an unblocked in-progress task,
-        and they haven't exceeded per-agent turn cap.
+        either inbox is non-empty OR they have an unblocked open task, and
+        they haven't exceeded their role-class turn cap.
 
-        A `complete` agent is reactivated if a directive/task/blocker arrives
-        in their inbox — this is how follow-up corrections get picked up
-        (e.g., supervisor asking the agent to redo work)."""
+        A `complete` agent is reactivated when an intervention message (or,
+        for managers, a report's deliverable) arrives — this is how follow-up
+        corrections and roll-up verification get picked up. Agents idle with
+        no open work count down to auto-retirement here (the anti-wedge for
+        the all-agents-complete completion gate)."""
         ready: list[Agent] = []
         for name, agent in self.agents.items():
             s = agent.state
             if s.status == "thinking":
                 continue
-            # Consecutive-error backoff: skip this agent until enough ticks
-            # have elapsed since their last error. min(consecutive_errors,
-            # ERROR_BACKOFF_TICKS) means 1 tick after first error, 2 after
-            # second, capped at ERROR_BACKOFF_TICKS to keep the wait bounded.
-            # We compare against `_tick_count` rather than `_global_turns` so
-            # the window ages even when no other agent dispatched in between.
-            if (
-                s.consecutive_errors
-                and s.last_error_at_turn is not None
-                and (self._tick_count - s.last_error_at_turn)
-                < min(s.consecutive_errors, ERROR_BACKOFF_TICKS)
-            ):
+            if self._in_error_backoff(s) or self._held(s):
                 continue
+            cap = self._turn_cap_for(s)
             if s.status == "complete":
-                if s.turns_taken < MAX_TURNS_PER_AGENT and any(
-                    m.msg_type in self.REACTIVATING_MSG_TYPES for m in s.inbox
-                ):
+                if s.turns_taken < cap and self._has_reactivating_msg(s):
                     s.status = "working"
                     self._emit("agent_reactivated", {"agent": name})
                 else:
                     continue
-            if s.turns_taken >= MAX_TURNS_PER_AGENT:
+            if s.turns_taken >= cap:
                 if s.status != "complete":
                     s.status = "complete"
                     self._emit("agent_capped", {"agent": name})
@@ -837,30 +937,91 @@ class Orchestrator:
 
             if has_inbox or has_unblocked_task or s.turns_taken == 0:
                 # First-turn agents are always ready (lets them initialize).
+                s.idle_ticks = 0
                 ready.append(agent)
-            elif s.assigned_tasks:
-                # All assigned tasks blocked → wait, increment blocked counter.
+                continue
+
+            open_assigned = [
+                tid
+                for tid in s.assigned_tasks
+                if tid in self.world.tasks
+                and self.world.tasks[tid].status not in ("complete", "cancelled")
+            ]
+            if open_assigned:
+                # Open tasks, all dep-blocked → wait, increment blocked counter.
                 s.status = "blocked"
                 s.blocked_turns += 1
                 if s.blocked_turns >= ESCALATION_AFTER_BLOCKED_TURNS:
                     self._auto_escalate(agent)
+            else:
+                # No inbox, no open work at all → idle; retire eventually.
+                self._maybe_auto_retire(agent)
+        # Least-recently-active first: with ready ≫ concurrency, dict
+        # insertion order would perpetually favor early-spawned agents.
+        ready.sort(key=lambda a: a.state.last_activity_at)
         return ready
+
+    def _maybe_auto_retire(self, agent: Agent) -> None:
+        """Idle sweep: an agent with an empty inbox, no open work, and at
+        least one turn taken counts down to retirement. Managers stay alive
+        while they have active reports or open tasks they created — roll-ups
+        and escalations must still find them. Retirement is reversible: a
+        directive/task/blocker reactivates a retired agent like any other
+        completed one."""
+        s = agent.state
+        if s.turns_taken == 0:
+            return
+        s.idle_ticks += 1
+        if s.idle_ticks < AUTO_RETIRE_IDLE_TICKS:
+            return
+        if self._active_report_count(s.name) > 0:
+            return
+        if any(
+            t.creator == s.name and t.status not in ("complete", "cancelled")
+            for t in self.world.tasks.values()
+        ):
+            return
+        s.status = "complete"
+        s.idle_ticks = 0
+        s.notes.append("auto-retired: idle with no open work")
+        self._emit("agent_auto_retired", {"agent": s.name, "manager": s.manager})
+        if s.manager and s.manager in self.world.agents:
+            self.bus.deliver(
+                Message(
+                    from_agent="orchestrator",
+                    to_agent=s.manager,
+                    msg_type="status",  # non-reactivating by design
+                    subject=f"{s.name} auto-retired",
+                    body=(
+                        f"{s.name} ({s.role.value}) had no open work for "
+                        f"{AUTO_RETIRE_IDLE_TICKS} evaluations and was retired."
+                    ),
+                )
+            )
+
+    def _any_retirement_pending(self) -> bool:
+        """True while some agent's idle-retirement countdown is in the live
+        window [1, AUTO_RETIRE_IDLE_TICKS]. The main loop keeps ticking
+        through these instead of declaring a stall so the countdown can
+        complete. Counts past the threshold (retirement blocked by active
+        reports / open created tasks) deliberately do NOT keep the loop
+        alive — that situation needs the stall machinery, not more ticks."""
+        return any(
+            a.state.status != "complete"
+            and 0 < a.state.idle_ticks <= AUTO_RETIRE_IDLE_TICKS
+            for a in self.agents.values()
+        )
 
     def _any_agent_in_error_backoff(self) -> bool:
         """True if at least one not-yet-given-up agent is currently being
-        skipped purely because of the error backoff window. Used by the
-        main loop to keep ticking instead of declaring stall while the
-        backoff plays out — the next tick will age the window."""
+        skipped because of the error backoff window or a verify-loop hold.
+        Used by the main loop to keep ticking instead of declaring stall
+        while the window plays out — the next tick ages it."""
         for agent in self.agents.values():
             s = agent.state
             if s.status == "complete":
                 continue
-            if (
-                s.consecutive_errors
-                and s.last_error_at_turn is not None
-                and (self._tick_count - s.last_error_at_turn)
-                < min(s.consecutive_errors, ERROR_BACKOFF_TICKS)
-            ):
+            if self._in_error_backoff(s) or self._held(s):
                 return True
         return False
 
@@ -872,6 +1033,7 @@ class Orchestrator:
                 agent.state.status == "blocked"
                 and agent.state.blocked_turns >= ESCALATION_AFTER_BLOCKED_TURNS
             ):
+                target = self._escalation_target(agent.state) or "the user"
                 # Synthesize a self-prompt to wake them up.
                 self.bus.deliver(
                     Message(
@@ -882,7 +1044,8 @@ class Orchestrator:
                         body=(
                             "You have made no progress for several turns. "
                             "Either send a clarifying question to a teammate, "
-                            "escalate to your supervisor, or mark complete with a status note."
+                            f"escalate to your manager ({target}) via the "
+                            "escalate action, or mark complete with a status note."
                         ),
                     )
                 )
@@ -911,6 +1074,29 @@ class Orchestrator:
             },
         )
 
+        # Any coherent turn (valid deliverable, blocked marker, planner JSON)
+        # resets the no-deliverable streak; only turns that synthesized a
+        # no_deliverable action sustain it.
+        if agent.state.consecutive_no_deliverable and not any(
+            a.get("type") == "no_deliverable" for a in turn.actions
+        ):
+            agent.state.consecutive_no_deliverable = 0
+
+        # Mandate context for spawn validation: a spawn without a brief must
+        # be accompanied, in this same turn, by a task or directive aimed at
+        # the new agent.
+        self._turn_task_assignees = {
+            str(a.get("assignee", ""))
+            for a in turn.actions
+            if a.get("type") == "create_task"
+        }
+        self._turn_directive_targets = {
+            str(a.get("to", ""))
+            for a in turn.actions
+            if a.get("type") == "send_message"
+            and a.get("msg_type") in ("directive", "task")
+        }
+
         for action in turn.actions:
             try:
                 self._apply_action(agent, action)
@@ -920,6 +1106,9 @@ class Orchestrator:
                     {"agent": agent.state.name, "action": action, "error": str(e)},
                 )
                 agent.state.notes.append(f"action error: {e}")
+
+        self._turn_task_assignees = set()
+        self._turn_directive_targets = set()
 
         rejected = agent.state.name in self._rejected_this_turn
         self._log_transcript(agent, turn, accepted=not rejected)
@@ -1047,15 +1236,36 @@ class Orchestrator:
                     )
                 )
                 return
+            task_id = str(action.get("id") or _id("task"))
+            if task_id in self.world.tasks:
+                # Idempotency: re-issuing an existing task ID must not reset
+                # its status or re-deliver the assignment. Reactivated
+                # planners replaying earlier turns (and LLM retries) would
+                # otherwise resurrect completed tasks and the run would never
+                # converge.
+                self._emit(
+                    "create_task_duplicate",
+                    {"agent": agent.state.name, "task_id": task_id},
+                )
+                return
             task = Task(
-                id=str(action.get("id") or _id("task")),
+                id=task_id,
                 title=str(action.get("title", "Untitled")),
                 description=str(action.get("description", "")),
                 assignee=assignee_name,
                 creator=agent.state.name,
                 depends_on=list(action.get("depends_on", []) or []),
+                doc_refs=list(action.get("doc_refs", []) or []),
                 acceptance_criteria=list(action.get("acceptance_criteria", []) or []),
             )
+            # Unknown doc_refs are a warning, not a rejection — the doc may
+            # legitimately be published later this turn or by a peer.
+            unknown_docs = [d for d in task.doc_refs if d not in self.world.shared_docs]
+            if unknown_docs:
+                self._emit(
+                    "task_doc_ref_unknown",
+                    {"task_id": task.id, "unknown": unknown_docs},
+                )
             # Surface dangling dependency IDs. Forward references are legal
             # (the dep may be created later this turn or by a peer), so we warn
             # rather than reject — but a permanently-unknown dep leaves the task
@@ -1088,23 +1298,13 @@ class Orchestrator:
             self._emit("task_created", {"id": task.id, "title": task.title})
 
         elif action_type == "spawn_agent":
-            if not self._can_spawn(agent):
-                self._emit(
-                    "policy_violation",
-                    {"agent": agent.state.name, "reason": "cannot spawn agents"},
-                )
-                return
-            if len(self.agents) >= self.max_agents:
-                self._emit("spawn_capped", {"reason": "max_agents reached"})
-                return
-            try:
-                role = Role(action.get("role"))
-            except ValueError:
-                self._emit("spawn_invalid", {"role": action.get("role")})
-                return
-            name = str(action.get("name") or self._unique_name(role))
-            specialization = str(action.get("specialization", ""))
-            self._spawn_agent(role, name, specialization)
+            self._dispatch_spawn(agent, action)
+
+        elif action_type == "retire_agent":
+            self._dispatch_retire(agent, action)
+
+        elif action_type == "no_deliverable":
+            self._handle_no_deliverable(agent, action)
 
         elif action_type == "deliverable":
             # If a prior verify in this same turn failed, refuse to record the
@@ -1186,20 +1386,19 @@ class Orchestrator:
                     break
             if not anchored:
                 # Roll-up deliverable from an agent without an open task
-                # (e.g. Tech Lead summarizing the team's work). Route to
-                # their supervisor so the chain-of-command keeps moving.
-                supervisor_role = SUPERVISOR_OF.get(agent.state.role)
-                target = self._first_agent_of_role(supervisor_role) if supervisor_role else None
-                if target:
-                    self.bus.deliver(
-                        Message(
-                            from_agent=agent.state.name,
-                            to_agent=target,
-                            msg_type="deliverable",
-                            subject=f"Roll-up: {action.get('title', 'deliverable')}",
-                            body=str(action.get("summary", "")),
-                        )
+                # (e.g. a lead summarizing the team's work). Route up the
+                # management chain; at the root this reaches the human user
+                # instead of silently dropping.
+                target = self._escalation_target(agent.state)
+                self.bus.deliver(
+                    Message(
+                        from_agent=agent.state.name,
+                        to_agent=target or "user",
+                        msg_type="deliverable",
+                        subject=f"Roll-up: {action.get('title', 'deliverable')}",
+                        body=str(action.get("summary", "")),
                     )
+                )
             self._landed_deliverables += 1
             self._maybe_refresh_codebase_map()
 
@@ -1304,6 +1503,280 @@ class Orchestrator:
         else:
             self._emit("unknown_action", {"agent": agent.state.name, "type": action_type})
 
+    def _dispatch_spawn(self, agent: Agent, action: dict[str, Any]) -> None:
+        """Validate and execute a spawn_agent action. Ordered checks; every
+        rejection emits `spawn_rejected` AND delivers a blocker to the
+        spawner — a silent event gives the model no self-correction signal."""
+        spawner = agent.state
+        if not self._can_spawn(agent):
+            # Specialists can't spawn at all. Keep the legacy event for this
+            # case — it's a role-permission violation, not a fixable spawn.
+            self._emit(
+                "policy_violation",
+                {"agent": spawner.name, "reason": "cannot spawn agents"},
+            )
+            return
+
+        raw_role = action.get("role")
+        try:
+            role = Role(raw_role)
+        except ValueError:
+            self._reject_spawn(
+                agent,
+                "invalid_role",
+                f"Unknown role {raw_role!r}. Valid roles: "
+                + ", ".join(sorted(r.value for r in Role if r is not Role.USER))
+                + ".",
+                extra={"role": raw_role},
+            )
+            return
+
+        allowed = SPAWNABLE_BY.get(spawner.role, frozenset())
+        if role not in allowed:
+            self._reject_spawn(
+                agent,
+                "role_not_spawnable",
+                f"A {spawner.role.value} may only spawn: "
+                + ", ".join(sorted(r.value for r in allowed))
+                + f". To staff {role.value} work, delegate through a tech_lead.",
+                extra={"role": role.value},
+            )
+            return
+
+        if len(self.agents) >= self.max_agents:
+            self._reject_spawn(
+                agent,
+                "max_agents",
+                f"The org is at its --max-agents cap ({self.max_agents}). "
+                "Retire idle reports (retire_agent) or finish in-flight work "
+                "before staffing more.",
+            )
+            return
+
+        name = str(action.get("name") or self._unique_name(role))
+        if name in self.agents:
+            # No-op rather than rejection: reactivated planners replay their
+            # earlier spawn actions verbatim. The existing agent (and its
+            # manager edge) is left untouched.
+            self._emit("spawn_duplicate", {"name": name, "spawner": spawner.name})
+            return
+
+        if self._active_report_count(spawner.name) >= MAX_DIRECT_REPORTS:
+            self._reject_spawn(
+                agent,
+                "span_of_control",
+                f"You already have {MAX_DIRECT_REPORTS} active direct reports. "
+                "Spawn a tech_lead sub-lead for a sub-domain and delegate "
+                "through them, or retire completed reports first.",
+                extra={"active_reports": self._active_report_count(spawner.name)},
+            )
+            return
+
+        brief = str(action.get("brief", "") or "").strip()
+        if not (
+            brief
+            or name in self._turn_task_assignees
+            or name in self._turn_directive_targets
+        ):
+            self._reject_spawn(
+                agent,
+                "no_mandate",
+                f"Spawn of {name!r} carried no purpose. Include a non-empty "
+                "`brief`, or create_task / send a directive to the new agent "
+                "in the same turn. Every agent must have a mandate.",
+                extra={"name": name},
+            )
+            return
+
+        specialization = str(action.get("specialization", ""))
+        self._spawn_agent(
+            role, name, specialization, manager=spawner.name, brief=brief
+        )
+        if brief:
+            self.bus.deliver(
+                Message(
+                    from_agent=spawner.name,
+                    to_agent=name,
+                    msg_type="directive",
+                    subject="Your mandate",
+                    body=brief,
+                )
+            )
+
+    def _reject_spawn(
+        self,
+        agent: Agent,
+        reason: str,
+        guidance: str,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
+        payload: dict[str, Any] = {"agent": agent.state.name, "reason": reason}
+        if extra:
+            payload.update(extra)
+        self._emit("spawn_rejected", payload)
+        self.bus.deliver(
+            Message(
+                from_agent="orchestrator",
+                to_agent=agent.state.name,
+                msg_type="blocker",
+                subject=f"Spawn rejected: {reason}",
+                body=guidance,
+            )
+        )
+
+    def _dispatch_retire(self, agent: Agent, action: dict[str, Any]) -> None:
+        """Manager-issued retirement of a direct report. Only the direct
+        manager may retire, and never while the report still has open tasks —
+        an open task assigned to a completed agent would wedge the
+        completion gate with no one left to work it."""
+        target_name = str(action.get("name", "")).strip()
+        reason = str(action.get("reason", "")).strip() or "work complete"
+        target = self.world.agents.get(target_name)
+
+        problem: Optional[str] = None
+        if target is None:
+            problem = f"no agent named {target_name!r} exists."
+        elif target.manager != agent.state.name:
+            problem = (
+                f"{target_name} is not your direct report — only their "
+                "manager can retire them."
+            )
+        else:
+            open_tasks = [
+                tid
+                for tid in target.assigned_tasks
+                if tid in self.world.tasks
+                and self.world.tasks[tid].status not in ("complete", "cancelled")
+            ]
+            if open_tasks:
+                problem = (
+                    f"{target_name} still has open tasks "
+                    f"({', '.join(open_tasks)}). Wait for them to complete, "
+                    "or cancel/reassign that work first."
+                )
+        if problem is not None:
+            self._emit(
+                "retire_agent_invalid",
+                {"agent": agent.state.name, "target": target_name, "reason": problem},
+            )
+            self.bus.deliver(
+                Message(
+                    from_agent="orchestrator",
+                    to_agent=agent.state.name,
+                    msg_type="blocker",
+                    subject="retire_agent rejected",
+                    body=f"You tried to retire {target_name!r}, but {problem}",
+                )
+            )
+            return
+
+        assert target is not None
+        target.status = "complete"
+        target.notes.append(f"retired by {agent.state.name}: {reason}")
+        self._emit(
+            "agent_retired",
+            {"agent": target_name, "by": agent.state.name, "reason": reason},
+        )
+        self.bus.deliver(
+            Message(
+                from_agent=agent.state.name,
+                to_agent=target_name,
+                msg_type="status",  # non-reactivating: audit trail only
+                subject="You have been retired",
+                body=reason,
+            )
+        )
+
+    def _handle_no_deliverable(self, agent: Agent, action: dict[str, Any]) -> None:
+        """A specialist turn produced no parseable DELIVERABLE block. Track
+        the streak and escalate through: corrective blocker (quoting the
+        required format) → manager escalation → force-complete."""
+        s = agent.state
+        s.consecutive_no_deliverable += 1
+        kind = str(action.get("kind", "missing"))
+        raw_tail = str(action.get("raw_tail", ""))
+        if raw_tail:
+            s.notes.append(raw_tail[-1000:])
+
+        if kind == "parse_error":
+            self._emit(
+                "deliverable_parse_error",
+                {
+                    "agent": s.name,
+                    "count": s.consecutive_no_deliverable,
+                    "error": str(action.get("error", "")),
+                    "block_preview": str(action.get("block_preview", ""))[:500],
+                },
+            )
+        else:
+            self._emit(
+                "deliverable_missing",
+                {"agent": s.name, "count": s.consecutive_no_deliverable},
+            )
+
+        if s.consecutive_no_deliverable >= NO_DELIVERABLE_GIVEUP_AT:
+            s.status = "complete"
+            s.notes.append(
+                f"force-completed after {s.consecutive_no_deliverable} turns "
+                "without a deliverable"
+            )
+            self._emit(
+                "agent_given_up",
+                {
+                    "agent": s.name,
+                    "reason": "no_deliverable",
+                    "count": s.consecutive_no_deliverable,
+                },
+            )
+            return
+
+        if s.consecutive_no_deliverable == NO_DELIVERABLE_ESCALATE_AT:
+            self._escalate_or_park(
+                agent,
+                subject=(
+                    f"{s.name} produced no deliverable for "
+                    f"{s.consecutive_no_deliverable} turns"
+                ),
+                body=(
+                    f"{s.name} ({s.role.value}) has taken "
+                    f"{s.consecutive_no_deliverable} turns without emitting a "
+                    f"parseable DELIVERABLE block. Last response tail:\n"
+                    f"…{raw_tail[-800:]}\n\n"
+                    "Redirect them, reassign the task, or retire them."
+                ),
+                msg_type="blocker",
+                from_agent="orchestrator",
+            )
+            self._emit(
+                "no_deliverable_escalated",
+                {"agent": s.name, "count": s.consecutive_no_deliverable},
+            )
+            return
+
+        if s.consecutive_no_deliverable == NO_DELIVERABLE_CORRECT_AT:
+            error_text = str(action.get("error", ""))
+            body = (
+                "Your recent responses did not end with a parseable "
+                "DELIVERABLE block, so none of your work could be accepted.\n\n"
+                + (f"JSON error: {error_text}\n\n" if error_text else "")
+                + f"The tail of your last response was:\n…{raw_tail[-800:]}\n\n"
+                "Your response must end with EXACTLY one line:\n"
+                + DELIVERABLE_FORMAT_REMINDER
+            )
+            self.bus.deliver(
+                Message(
+                    from_agent="orchestrator",
+                    to_agent=s.name,
+                    msg_type="blocker",
+                    subject="Format error: missing/invalid DELIVERABLE block",
+                    body=body,
+                )
+            )
+            self._emit(
+                "deliverable_format_corrected",
+                {"agent": s.name, "count": s.consecutive_no_deliverable},
+            )
+
     def _dispatch_verify(self, agent: Agent, action: dict[str, Any]) -> None:
         """Run the named verifier against the agent's worktree. Running against
         the worktree (not the shared workspace) is the whole point of per-agent
@@ -1374,6 +1847,12 @@ class Orchestrator:
             agent.state.notes.append(
                 f"verify ok ({verifier_name}): {result.summary}"
             )
+            # A pass clears any failure streaks for this verifier.
+            agent.state.verify_failures = {
+                k: v
+                for k, v in agent.state.verify_failures.items()
+                if not k.startswith(f"{verifier_name}:")
+            }
             return
 
         self._emit("verify_failed", {**payload, "details": result.details})
@@ -1381,6 +1860,22 @@ class Orchestrator:
             f"verify failed ({verifier_name}): {result.summary}"
         )
         self._rejected_this_turn.add(agent.state.name)
+
+        # Bound identical-failure retry loops: the streak is keyed on the
+        # exact failure summary, so a *different* failure restarts the count.
+        streak_key = f"{verifier_name}:{_doc_hash(result.summary)}"
+        streak = agent.state.verify_failures.get(streak_key, 0) + 1
+        agent.state.verify_failures[streak_key] = streak
+        if streak >= VERIFY_LOOP_ESCALATE_AT:
+            agent.state.verify_failures[streak_key] = 0
+            self._escalate_verify_loop(
+                agent,
+                source=f"verify action ({verifier_name})",
+                summary=result.summary,
+                count=streak,
+            )
+            return
+
         self.bus.deliver(
             Message(
                 from_agent="orchestrator",
@@ -1395,6 +1890,58 @@ class Orchestrator:
                 ),
             )
         )
+
+    def _escalate_verify_loop(
+        self,
+        agent: Agent,
+        *,
+        source: str,
+        summary: str,
+        count: int,
+        task: Optional[Task] = None,
+    ) -> None:
+        """The same verification keeps failing identically: stop re-blocking
+        the agent (retry N+1 won't differ), escalate to the manager with the
+        verbatim verifier output, and hold the agent a few evaluations so the
+        manager gets a window to redirect. In unattended runs with no manager
+        to intervene, the task is cancelled so the org converges honestly
+        instead of looping to the turn cap."""
+        target = self._escalate_or_park(
+            agent,
+            subject=f"{agent.state.name} stuck in a verify loop ({source})",
+            body=(
+                f"{agent.state.name} has failed {source} {count} times with "
+                f"identical output:\n{summary}\n\n"
+                + (f"Task: {task.id} ({task.title})\n" if task is not None else "")
+                + "Retrying won't change the outcome — redirect them, "
+                "reassign the work, or amend the criterion."
+            ),
+            msg_type="blocker",
+            from_agent="orchestrator",
+        )
+        agent.state.hold_until_tick = self._tick_count + VERIFY_HOLD_EVALUATIONS
+        self._emit(
+            "verify_loop_escalated",
+            {
+                "agent": agent.state.name,
+                "source": source,
+                "summary": summary,
+                "count": count,
+                "manager": target,
+                "task_id": task.id if task is not None else None,
+            },
+        )
+        if target is None and self.unattended and task is not None:
+            task.status = "cancelled"
+            self._emit(
+                "task_abandoned",
+                {
+                    "task_id": task.id,
+                    "title": task.title,
+                    "summary": summary,
+                    "reason": "verify loop with no manager to intervene",
+                },
+            )
 
     def _maybe_refresh_codebase_map(self) -> None:
         """In brownfield mode, periodically re-run the codebase scan so the
@@ -1505,6 +2052,18 @@ class Orchestrator:
                     "to": result.details.get("substituted_to"),
                 },
             )
+        # Identical-failure streak: compared against the PREVIOUS check's
+        # summary (before overwrite below). A pass or a different failure
+        # message restarts the count.
+        if result.ok:
+            criterion.consecutive_identical_failures = 0
+        elif (
+            criterion.last_status == "failed"
+            and criterion.last_summary == result.summary
+        ):
+            criterion.consecutive_identical_failures += 1
+        else:
+            criterion.consecutive_identical_failures = 1
         criterion.last_status = "passed" if result.ok else "failed"
         criterion.last_summary = result.summary
         criterion.last_checked_turn = self._global_turns
@@ -1551,6 +2110,46 @@ class Orchestrator:
         failures: list[tuple[int, AcceptanceCriterion, VerifierResult]],
     ) -> None:
         self._rejected_this_turn.add(agent.state.name)
+
+        # If any failing criterion has hit the identical-failure threshold,
+        # stop the retry loop: no blocker to the agent (retry N+1 would be
+        # identical), escalate to the manager instead. Streak resets so an
+        # intervention gets a fresh failure budget rather than re-escalating
+        # on every subsequent check.
+        looping = [
+            (idx, c, r)
+            for idx, c, r in failures
+            if c.consecutive_identical_failures >= VERIFY_LOOP_ESCALATE_AT
+        ]
+        if looping:
+            idx, criterion, result = looping[0]
+            count = criterion.consecutive_identical_failures
+            for _, c, _r in looping:
+                c.consecutive_identical_failures = 0
+            agent.state.notes.append(
+                f"verify loop on {task.id} criterion [{idx}] — escalated to manager"
+            )
+            self._emit(
+                "deliverable_rejected",
+                {
+                    "agent": agent.state.name,
+                    "task_id": task.id,
+                    "verify_loop": True,
+                    "criterion_failures": [
+                        {"index": i, "text": c.text, "summary": r.summary}
+                        for i, c, r in failures
+                    ],
+                },
+            )
+            self._escalate_verify_loop(
+                agent,
+                source=f"criterion [{idx}] {criterion.text!r}",
+                summary=result.summary,
+                count=count,
+                task=task,
+            )
+            return
+
         summary_lines = [
             f"  - [{idx}] {c.text}: {r.summary}" for idx, c, r in failures
         ]
@@ -1640,14 +2239,31 @@ class Orchestrator:
 
     # ---- helpers ----------------------------------------------------------
 
-    def _spawn_agent(self, role: Role, name: str, specialization: str) -> Agent:
+    def _spawn_agent(
+        self,
+        role: Role,
+        name: str,
+        specialization: str,
+        *,
+        manager: Optional[str] = None,
+        brief: str = "",
+    ) -> Agent:
         if name in self.agents:
             return self.agents[name]
-        state = AgentState(name=name, role=role, specialization=specialization)
+        state = AgentState(
+            name=name,
+            role=role,
+            specialization=specialization,
+            manager=manager,
+            brief=brief,
+        )
         self.world.agents[name] = state
         agent = Agent(state, self.backend)
         self.agents[name] = agent
-        self._emit("agent_spawned", {"name": name, "role": role.value})
+        self._emit(
+            "agent_spawned",
+            {"name": name, "role": role.value, "manager": manager},
+        )
         return agent
 
     # ---- end Orchestrator class methods follow above; module-level helpers below ----
@@ -1660,6 +2276,16 @@ class Orchestrator:
                 return agent.state.name
         return None
 
+    def _direct_reports(self, name: str) -> list[AgentState]:
+        return [s for s in self.world.agents.values() if s.manager == name]
+
+    def _active_report_count(self, name: str) -> int:
+        return sum(
+            1
+            for s in self.world.agents.values()
+            if s.manager == name and s.status != "complete"
+        )
+
     def _unique_name(self, role: Role) -> str:
         base = role.value.replace("_", "-")
         n = 1
@@ -1668,11 +2294,11 @@ class Orchestrator:
         return f"{base}-{n}"
 
     def _can_spawn(self, agent: Agent) -> bool:
-        return agent.state.role in ROLES_THAT_SPAWN
+        return agent.state.role in MANAGER_ROLES
 
     def _can_create_tasks(self, agent: Agent) -> bool:
         # EM and TL primarily; PM may also create high-level tasks.
-        return agent.state.role in ROLES_THAT_SPAWN
+        return agent.state.role in MANAGER_ROLES
 
     def _notify_downstream(self, completed: Task) -> None:
         """When a task completes, ping the assignees of every task that
@@ -1695,47 +2321,127 @@ class Orchestrator:
                         )
                     )
 
-    def _escalate(self, agent: Agent, reason: str) -> None:
-        supervisor_role = SUPERVISOR_OF.get(agent.state.role)
-        if supervisor_role is None or supervisor_role == Role.USER:
+    def _escalation_target(self, state: AgentState) -> Optional[str]:
+        """Name of the nearest live manager up the spawn tree, or None when
+        the chain tops out at the human user. Skips managers that no longer
+        exist and managers that are permanently turn-capped (they can never
+        take another turn — a message to them is a black hole). Cycle-guarded
+        against malformed manager edges."""
+        seen: set[str] = set()
+        current = state.manager
+        while current is not None and current not in seen:
+            seen.add(current)
+            manager = self.world.agents.get(current)
+            if manager is None:
+                return None
+            if manager.turns_taken < self._turn_cap_for(manager):
+                return current
+            current = manager.manager
+        return None
+
+    def _escalate_or_park(
+        self,
+        agent: Agent,
+        *,
+        subject: str,
+        body: str,
+        msg_type: str = "escalation",
+        from_agent: Optional[str] = None,
+    ) -> Optional[str]:
+        """Single escalation funnel: deliver to the nearest live manager and
+        return their name, or — when the chain tops out at the human — park
+        the message in pending_user_questions and return None. The run keeps
+        going either way; parked questions surface in the final summary.
+
+        In unattended runs a parked escalation additionally sends the agent a
+        decide-and-proceed self-directive; after
+        UNRESOLVED_ESCALATIONS_GIVEUP_AT of them the agent is force-completed
+        so the rest of the org converges instead of wedging on a question
+        nobody will answer."""
+        sender = from_agent or agent.state.name
+        target = self._escalation_target(agent.state)
+        if target is not None:
             self.bus.deliver(
                 Message(
-                    from_agent=agent.state.name,
-                    to_agent="user",
-                    msg_type="escalation",
-                    subject=f"Escalation from {agent.state.name}",
-                    body=reason,
+                    from_agent=sender,
+                    to_agent=target,
+                    msg_type=msg_type,  # type: ignore[arg-type]
+                    subject=subject,
+                    body=body,
                 )
             )
-            self._emit("escalation_to_user", {"agent": agent.state.name, "reason": reason})
-            return
-        # Find the nearest agent of that supervisor role.
-        for target in self.agents.values():
-            if target.state.role == supervisor_role:
-                self.bus.deliver(
-                    Message(
-                        from_agent=agent.state.name,
-                        to_agent=target.state.name,
-                        msg_type="escalation",
-                        subject=f"Escalation: {agent.state.name} blocked",
-                        body=reason,
-                    )
-                )
-                self._emit(
-                    "escalation",
-                    {"from": agent.state.name, "to": target.state.name, "reason": reason},
-                )
-                return
-        # No supervisor found — bubble straight to user.
+            self._emit(
+                "escalation",
+                {"from": agent.state.name, "to": target, "reason": body[:300]},
+            )
+            return target
+
         self.bus.deliver(
             Message(
-                from_agent=agent.state.name,
+                from_agent=sender,
                 to_agent="user",
-                msg_type="escalation",
-                subject=f"Escalation from {agent.state.name} (no supervisor in team)",
-                body=reason,
+                msg_type=msg_type,  # type: ignore[arg-type]
+                subject=subject,
+                body=body,
             )
         )
+        self._emit(
+            "escalation_unresolvable",
+            {
+                "agent": agent.state.name,
+                "subject": subject,
+                "unattended": self.unattended,
+            },
+        )
+        if not self.unattended:
+            return None
+
+        s = agent.state
+        s.unanswered_escalations += 1
+        if s.unanswered_escalations >= UNRESOLVED_ESCALATIONS_GIVEUP_AT:
+            if s.status != "complete":
+                s.status = "complete"
+            s.notes.append(
+                f"force-completed after {s.unanswered_escalations} "
+                "unresolvable escalations (unattended run)"
+            )
+            self._emit(
+                "agent_given_up",
+                {
+                    "agent": s.name,
+                    "reason": "unresolvable_escalation",
+                    "unanswered_escalations": s.unanswered_escalations,
+                },
+            )
+        else:
+            self.bus.deliver(
+                Message(
+                    from_agent="orchestrator",
+                    to_agent=s.name,
+                    msg_type="directive",
+                    subject="No manager or human available — decide and proceed",
+                    body=(
+                        "Your escalation could not reach a manager and no "
+                        "human is attending this run. Make the most "
+                        "reasonable decision yourself, record it with a "
+                        "`note` action, and proceed — or mark your task "
+                        "blocked and complete with a status note."
+                    ),
+                )
+            )
+        return None
+
+    def _escalate(self, agent: Agent, reason: str) -> None:
+        target = self._escalate_or_park(
+            agent,
+            subject=f"Escalation: {agent.state.name} blocked",
+            body=reason,
+        )
+        if target is None:
+            self._emit(
+                "escalation_to_user",
+                {"agent": agent.state.name, "reason": reason},
+            )
 
     def _auto_escalate(self, agent: Agent) -> None:
         if any(t for t in self.world.tasks.values() if t.assignee == agent.state.name and t.status != "complete"):
@@ -1769,6 +2475,10 @@ class Orchestrator:
         any_verifier = False
         unmet: list[tuple[str, int, str, str]] = []
         for task in self.world.tasks.values():
+            if task.status == "cancelled":
+                # Explicitly abandoned (verify loop / manager decision) —
+                # its criteria are moot and must not block completion forever.
+                continue
             for idx, c in enumerate(task.acceptance_criteria):
                 if not c.verifier:
                     continue
@@ -1796,14 +2506,19 @@ class Orchestrator:
         if self._completion_announced:
             return
         self._completion_announced = True
-        self._emit(
-            "stopped_on_completion",
-            {
-                "objective": objective,
-                "turns": self._global_turns,
-                "tasks": len(self.world.tasks),
-            },
+        cancelled = sum(
+            1 for t in self.world.tasks.values() if t.status == "cancelled"
         )
+        payload: dict[str, Any] = {
+            "objective": objective,
+            "turns": self._global_turns,
+            "tasks": len(self.world.tasks),
+        }
+        if cancelled:
+            # Honest accounting: completion with abandoned work is still
+            # completion, but the user must see it wasn't a clean sweep.
+            payload["cancelled_tasks"] = cancelled
+        self._emit("stopped_on_completion", payload)
 
     def _build_final_summary(self) -> str:
         lines = [
@@ -1887,10 +2602,21 @@ def _agent_state_from_dict(d: dict[str, Any]) -> AgentState:
     role = Role(d["role"])
     usage_d = d.get("usage") or {}
     last_error_at = d.get("last_error_at_turn")
+    manager = d.get("manager")
+    raw_verify_failures = d.get("verify_failures") or {}
+    verify_failures: dict[str, int] = {}
+    if isinstance(raw_verify_failures, dict):
+        for k, v in raw_verify_failures.items():
+            try:
+                verify_failures[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
     return AgentState(
         name=d["name"],
         role=role,
         specialization=d.get("specialization", ""),
+        manager=str(manager) if manager else None,
+        brief=str(d.get("brief") or ""),
         status=d.get("status", "idle"),
         inbox=[_message_from_dict(m) for m in d.get("inbox") or []],
         assigned_tasks=list(d.get("assigned_tasks") or []),
@@ -1900,6 +2626,13 @@ def _agent_state_from_dict(d: dict[str, Any]) -> AgentState:
         blocked_turns=int(d.get("blocked_turns") or 0),
         consecutive_errors=int(d.get("consecutive_errors") or 0),
         last_error_at_turn=int(last_error_at) if last_error_at is not None else None,
+        idle_ticks=int(d.get("idle_ticks") or 0),
+        consecutive_no_deliverable=int(d.get("consecutive_no_deliverable") or 0),
+        unanswered_escalations=int(d.get("unanswered_escalations") or 0),
+        verify_failures=verify_failures,
+        # The evaluation counter resets across resume, so a persisted hold
+        # would be meaningless (or worse, hold for the wrong duration).
+        hold_until_tick=None,
         notes=list(d.get("notes") or []),
         usage=TokenUsage(
             input_tokens=int(usage_d.get("input_tokens") or 0),

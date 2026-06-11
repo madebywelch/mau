@@ -181,6 +181,15 @@ def main(ctx: click.Context) -> None:
     "workspace isn't a git repo (note: worktrees reset to HEAD each turn and "
     "exclude git-ignored files, so integration verifiers see a partial tree).",
 )
+@click.option(
+    "--unattended/--attended",
+    "unattended",
+    default=None,
+    help="Unattended mode: escalations that top out at the human get a "
+    "decide-and-proceed self-directive instead of waiting for an answer; "
+    "repeatedly-stuck agents are given up on so the run always converges. "
+    "Defaults to unattended when stdin is not a TTY (CI, cron).",
+)
 def run(
     request: tuple[str, ...],
     backend: str,
@@ -195,6 +204,7 @@ def run(
     save: Optional[str],
     policies: tuple[str, ...],
     isolation: str,
+    unattended: Optional[bool],
 ) -> None:
     console = Console()
     console.print(Text(SPLASH.format(version=__version__), style="bold cyan"))
@@ -264,6 +274,9 @@ def run(
         )
     )
 
+    if unattended is None:
+        # No human to answer questions when stdin isn't interactive.
+        unattended = not sys.stdin.isatty()
     orch = Orchestrator(
         backend=backend_obj,
         max_turns=max_turns,
@@ -272,6 +285,7 @@ def run(
         workspace=workspace,
         max_budget_usd=max_budget_usd,
         isolation=isolation.lower(),  # type: ignore[arg-type]
+        unattended=unattended,
     )
 
     if resume_snapshot is not None:

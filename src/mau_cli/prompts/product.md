@@ -19,6 +19,12 @@ the *problem*, the *audience*, and the *success criteria*, then delegate.
    - Scope (in / out)
    - Constraints (deadlines, regulatory)
    - Open questions (only the ones an engineer can't answer alone)
+
+   `prd.md` is the ONE document every agent in the org sees regardless of
+   team (all other docs are team-scoped). For a large product the EM will
+   split it into epics, each owned by a lead and squad — so structure the
+   scope so it decomposes cleanly, and make sure everything any team would
+   need from product is in the PRD itself.
 3. If the original request is genuinely ambiguous, you MAY emit one
    `ask_user` action — but only on the first turn, and only one. Otherwise
    commit to a reasonable interpretation and note assumptions in the PRD.

@@ -67,6 +67,212 @@ def _detect_agent_name(user_prompt: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+# Matches the INBOX rendering of a deliverable/roll-up message:
+#   "[deliverable] from be-epic1 — Delivered: ..."
+_DELIVERABLE_FROM_RE = re.compile(r"\[deliverable\] from ([\w\-]+)")
+
+
+def _noop_complete(thoughts: str = "Nothing left to do.") -> dict[str, Any]:
+    """Terminal planner turn. Deep-org managers return this on reactivation
+    after their work is finalized — re-running their script would ping-pong
+    directives/roll-ups with their manager forever."""
+    return {"thoughts": thoughts, "status": "complete", "actions": []}
+
+
+# Deep-org scripts, keyed by agent name. Shape per manager:
+#   first    — staffing turn (spawn the level below, with mandates)
+#   wait_for — deliverable senders whose roll-ups must arrive before finalizing
+#   final    — retire reports (where meaningful), roll up, complete
+# Org shape: product-1 → em-1 → {tl-epic-1 → {tl-sub-1 → {db-sub-1, qa-sub-1},
+# be-epic1}, tl-epic-2 → fe-epic2} — four manager edges root-to-leaf.
+_DEEP_ORG_SCRIPTS: dict[str, dict[str, Any]] = {
+    "em-1": {
+        "first": {
+            "thoughts": "Two epics: the items service and the web experience.",
+            "status": "working",
+            "actions": [
+                {
+                    "type": "spawn_agent",
+                    "role": "tech_lead",
+                    "name": "tl-epic-1",
+                    "specialization": "items service",
+                    "brief": (
+                        "Own epic 1: the items service (API + data layer). "
+                        "Publish contracts, staff a squad — use a sub-lead "
+                        "if a sub-domain warrants it — and roll up to me "
+                        "when shipped."
+                    ),
+                },
+                {
+                    "type": "spawn_agent",
+                    "role": "tech_lead",
+                    "name": "tl-epic-2",
+                    "specialization": "web experience",
+                    "brief": (
+                        "Own epic 2: the web experience for items. Staff a "
+                        "squad and roll up to me when shipped."
+                    ),
+                },
+            ],
+        },
+        "wait_for": {"tl-epic-1", "tl-epic-2"},
+        "final": {
+            "thoughts": "Both epics rolled up. Retiring leads and reporting.",
+            "status": "complete",
+            "actions": [
+                {"type": "retire_agent", "name": "tl-epic-1", "reason": "epic 1 shipped"},
+                {"type": "retire_agent", "name": "tl-epic-2", "reason": "epic 2 shipped"},
+                {
+                    "type": "deliverable",
+                    "title": "Initiative complete",
+                    "summary": "Both epics shipped and verified.",
+                    "files_touched": [],
+                },
+                {"type": "complete", "summary": "Initiative delivered."},
+            ],
+        },
+    },
+    "tl-epic-1": {
+        "first": {
+            "thoughts": "Epic 1 splits into the API stream and a data sub-domain.",
+            "status": "working",
+            "actions": [
+                {
+                    "type": "write_doc",
+                    "name": "epic1-api-contract.md",
+                    "content": (
+                        "# Epic 1 API\n\n"
+                        "GET  /items       → 200 [{id,title}]\n"
+                        "POST /items {title} → 201 {id,title}\n"
+                    ),
+                },
+                {
+                    "type": "spawn_agent",
+                    "role": "tech_lead",
+                    "name": "tl-sub-1",
+                    "specialization": "items data layer",
+                    "brief": (
+                        "Own the items data sub-domain: storage schema and "
+                        "data quality. Staff what you need and roll up to me."
+                    ),
+                },
+                {
+                    "type": "spawn_agent",
+                    "role": "backend",
+                    "name": "be-epic1",
+                    "specialization": "items API",
+                },
+                {
+                    "type": "create_task",
+                    "id": "task_be_epic1",
+                    "title": "Implement items API per epic1-api-contract.md",
+                    "assignee": "be-epic1",
+                    "depends_on": [],
+                },
+            ],
+        },
+        "wait_for": {"tl-sub-1", "be-epic1"},
+        "final": {
+            "thoughts": "Sub-lead and API stream done. Rolling up epic 1.",
+            "status": "complete",
+            "actions": [
+                {"type": "retire_agent", "name": "tl-sub-1", "reason": "data sub-domain shipped"},
+                {
+                    "type": "deliverable",
+                    "title": "Epic 1: items service",
+                    "summary": "API and data layer shipped.",
+                    "files_touched": [],
+                },
+                {"type": "complete", "summary": "Epic 1 shipped."},
+            ],
+        },
+    },
+    "tl-sub-1": {
+        "first": {
+            "thoughts": "Data sub-domain: schema plus QA coverage.",
+            "status": "working",
+            "actions": [
+                {
+                    "type": "spawn_agent",
+                    "role": "database",
+                    "name": "db-sub-1",
+                    "specialization": "items schema",
+                },
+                {
+                    "type": "create_task",
+                    "id": "task_db_sub1",
+                    "title": "Create items schema migration",
+                    "assignee": "db-sub-1",
+                    "depends_on": [],
+                },
+                {
+                    "type": "spawn_agent",
+                    "role": "qa",
+                    "name": "qa-sub-1",
+                    "specialization": "items data quality",
+                },
+                {
+                    "type": "create_task",
+                    "id": "task_qa_sub1",
+                    "title": "Add data-layer smoke tests",
+                    "assignee": "qa-sub-1",
+                    "depends_on": [],
+                },
+            ],
+        },
+        "wait_for": {"db-sub-1", "qa-sub-1"},
+        "final": {
+            "thoughts": "Schema and tests landed.",
+            "status": "complete",
+            "actions": [
+                {
+                    "type": "deliverable",
+                    "title": "Items data layer",
+                    "summary": "Schema migration and smoke tests in place.",
+                    "files_touched": [],
+                },
+                {"type": "complete", "summary": "Data sub-domain shipped."},
+            ],
+        },
+    },
+    "tl-epic-2": {
+        "first": {
+            "thoughts": "Epic 2 is a single frontend stream.",
+            "status": "working",
+            "actions": [
+                {
+                    "type": "spawn_agent",
+                    "role": "frontend",
+                    "name": "fe-epic2",
+                    "specialization": "items web ui",
+                },
+                {
+                    "type": "create_task",
+                    "id": "task_fe_epic2",
+                    "title": "Build items list UI",
+                    "assignee": "fe-epic2",
+                    "depends_on": [],
+                },
+            ],
+        },
+        "wait_for": {"fe-epic2"},
+        "final": {
+            "thoughts": "UI landed. Rolling up epic 2.",
+            "status": "complete",
+            "actions": [
+                {
+                    "type": "deliverable",
+                    "title": "Epic 2: web experience",
+                    "summary": "Items list UI shipped.",
+                    "files_touched": [],
+                },
+                {"type": "complete", "summary": "Epic 2 shipped."},
+            ],
+        },
+    },
+}
+
+
 class MockBackend(InferenceBackend):
     name = "mock"
 
@@ -75,6 +281,7 @@ class MockBackend(InferenceBackend):
         *,
         cost_per_call_usd: float = 0.0,
         fail_first_n: Optional[dict[str, int]] = None,
+        deep_org: bool = False,
     ):
         # cost_per_call_usd lets tests simulate non-zero spend without standing
         # up a real backend. Defaults to 0.0 so existing tests are unaffected.
@@ -85,6 +292,14 @@ class MockBackend(InferenceBackend):
         # Used by Bug-5 backoff tests to model a transiently flaky agent.
         self.fail_first_n: dict[str, int] = dict(fail_first_n or {})
         self._call_counts: dict[str, int] = {}
+        # deep_org: scripted fractal org exercising 4 manager levels
+        # (product → em → epic lead → sub-lead → specialist), briefs,
+        # wave roll-ups, and retirement. Default False keeps every existing
+        # script byte-identical.
+        self.deep_org = deep_org
+        self._plan_calls: dict[str, int] = {}          # agent → planner calls
+        self._rollups_seen: dict[str, set[str]] = {}   # agent → deliverable senders
+        self._deep_finalized: set[str] = set()         # agents past their final turn
 
     def available(self) -> bool:
         return True
@@ -112,6 +327,10 @@ class MockBackend(InferenceBackend):
     def call_plan(self, system_prompt: str, user_prompt: str) -> InferenceResult:
         self._maybe_fail(user_prompt)
         role = _detect_role(system_prompt)
+        if self.deep_org:
+            return _wrap_plan(
+                self._deep_plan(role, user_prompt), cost_usd=self.cost_per_call_usd
+            )
         if role == "product":
             return _wrap_plan(self._product(), cost_usd=self.cost_per_call_usd)
         if role == "engineering_manager":
@@ -122,6 +341,38 @@ class MockBackend(InferenceBackend):
             {"thoughts": "unknown role", "status": "complete", "actions": []},
             cost_usd=self.cost_per_call_usd,
         )
+
+    def _deep_plan(self, role: str, user_prompt: str) -> dict[str, Any]:
+        """Name-dispatched fractal-org scripts. Each manager has three
+        phases: first turn (staff the level below), waiting turns (empty
+        actions until every awaited roll-up has appeared in an inbox), and
+        one finalize turn (retire reports where applicable, roll up,
+        complete) — then terminal no-ops, so reactivations can't replay
+        the script and ping-pong with the manager above."""
+        name = _detect_agent_name(user_prompt)
+        calls = self._plan_calls.get(name, 0)
+        self._plan_calls[name] = calls + 1
+        seen = self._rollups_seen.setdefault(name, set())
+        seen.update(_DELIVERABLE_FROM_RE.findall(user_prompt))
+
+        if role == "product":
+            return self._product() if calls == 0 else _noop_complete()
+
+        script = _DEEP_ORG_SCRIPTS.get(name)
+        if script is None:
+            return _noop_complete("No deep-org script for this agent.")
+        if name in self._deep_finalized:
+            return _noop_complete()
+        if calls == 0:
+            return script["first"]
+        if script["wait_for"] <= seen:
+            self._deep_finalized.add(name)
+            return script["final"]
+        return {
+            "thoughts": f"Waiting on roll-ups from {sorted(script['wait_for'] - seen)}.",
+            "status": "working",
+            "actions": [],
+        }
 
     # ---- agentic mode ----------------------------------------------------
 

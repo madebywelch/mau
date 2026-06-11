@@ -154,14 +154,22 @@ def extract_json(text: str) -> dict[str, Any]:
 
 
 def extract_deliverable(text: str) -> Optional[dict[str, Any]]:
-    """Pull the <DELIVERABLE>{...}</DELIVERABLE> block from agentic output."""
+    """Pull the <DELIVERABLE>{...}</DELIVERABLE> block from agentic output.
+
+    Three outcomes, deliberately distinguished:
+      - valid block → the parsed dict;
+      - block present but JSON-invalid → a `{"_parse_error", "_raw_block"}`
+        marker dict (truthy, so it flows through `... or {}` call sites
+        unchanged) — the agent layer turns this into a tracked
+        `no_deliverable` action instead of silently dropping the turn;
+      - no block at all → None."""
     match = _DELIVERABLE_RE.search(text or "")
     if not match:
         return None
     try:
         return json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as e:
+        return {"_parse_error": str(e), "_raw_block": match.group(1)[:500]}
 
 
 @dataclass

@@ -21,19 +21,35 @@ using a deterministic mock backend — no API calls, no spend. Replace
 ```
 USER (you, the human Product stakeholder)
   └─ product               ← drafts a PRD as shared/prd.md
-       └─ engineering_manager      ← decomposes into epics, engages a tech lead
-            └─ tech_lead           ← publishes architecture.md, api-contract.md, schema.md
-                 ├─ frontend (one or more)   ┐
-                 ├─ backend  (one or more)   │  agentic mode: full Read/Write/Edit/Bash
-                 ├─ database                 │  on workspace/ — they ship real files
-                 ├─ qa                       │
-                 └─ devops                   ┘
+       └─ engineering_manager      ← decomposes into epics, one tech lead per epic
+            ├─ tech_lead (epic A)  ← publishes contracts, staffs a squad
+            │    ├─ tech_lead (sub-domain, when the epic outgrows one squad)
+            │    │    └─ specialists…
+            │    ├─ frontend / backend / database  ┐ agentic mode: full
+            │    ├─ qa                             │ Read/Write/Edit/Bash —
+            │    └─ devops                         ┘ they ship real files
+            └─ tech_lead (epic B) …
 ```
+
+The org is **fractal**: whoever spawns an agent is its manager, leads can
+spawn sub-leads, and every spawn must carry a mandate (a brief or a
+same-turn task) — capacity comes from depth, not from one lead managing
+fifty workers. Each agent's prompt is **team-scoped** (its manager, peers,
+reports, and its team's docs — not the whole org), so prompt size stays
+constant as the org grows. Idle agents are retired by their manager (or
+automatically), escalations climb the spawn tree, and failure loops —
+malformed deliverables, repeatedly-failing verifiers — surface to the
+manager instead of silently burning turns.
 
 Vertical decomposition (top-down) and lateral coordination (peer-to-peer)
 are both first-class. Agents block on dependencies, talk to each other
 directly, and escalate up the chain when stuck. Token spend and cost are
 tracked live; a `--max-budget` cap halts the run when reached.
+
+Large orgs need larger limits: the defaults (`--max-agents 12`,
+`--max-turns 80`) are sized for cost-safe demos. A deep org needs roughly
+`--max-turns ≈ agents × average turns per agent` — e.g.
+`--max-agents 200 --max-turns 1500 --concurrency 8 --max-budget 50`.
 
 Inference runs through whatever Claude or Codex CLI is already installed
 and authenticated on your machine. There's also a deterministic mock
@@ -180,6 +196,7 @@ specialist headcount and turn budget.
 | `--save PATH` | Also persist a copy of `session.json` to this path. |
 | `--policy RULE` | Repeatable. Seed a durable policy. See `--policy 'role:<role>=<rule>'`. |
 | `--isolation {auto,shared,worktree}` | Per-agent isolation. `auto` = `shared` for greenfield, per-agent git worktrees for brownfield in a clean repo. `shared` forces single-cwd (correct integration semantics); `worktree` forces per-agent worktrees (git repo required; resets to HEAD each turn, excludes ignored files). |
+| `--unattended / --attended` | Unattended: escalations that top out at the human get a decide-and-proceed directive; repeatedly-stuck agents are given up on so the run always converges. Default: unattended when stdin isn't a TTY. |
 | `--version` | Show version and exit. |
 | `-h, --help` | Show help and exit. |
 
